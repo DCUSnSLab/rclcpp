@@ -9,6 +9,7 @@ find_package(ament_index_cpp REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(libstatistics_collector REQUIRED)
 find_package(rcl REQUIRED)
+find_package(rcl_executor REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(rcl_logging_interface REQUIRED)
 find_package(rcl_yaml_param_parser REQUIRED)
@@ -76,6 +77,7 @@ set(${PROJECT_NAME}_SRCS
   src/rclcpp/executors/static_single_threaded_executor.cpp
   src/rclcpp/expand_topic_or_service_name.cpp
   src/rclcpp/experimental/executors/events_executor/events_executor.cpp
+  src/rclcpp/experimental/executors/rcl_executor.cpp
   src/rclcpp/experimental/timers_manager.cpp
   src/rclcpp/future_return_code.cpp
   src/rclcpp/generic_client.cpp
@@ -229,6 +231,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
   ${builtin_interfaces_TARGETS}
   libstatistics_collector::libstatistics_collector
   rcl::rcl
+  rcl_executor::rcl_executor
   ${rcl_interfaces_TARGETS}
   rcl_yaml_param_parser::rcl_yaml_param_parser
   rcpputils::rcpputils
@@ -272,6 +275,7 @@ ament_export_dependencies(
   builtin_interfaces
   libstatistics_collector
   rcl
+  rcl_executor
   rcl_interfaces
   rcl_yaml_param_parser
   rcpputils

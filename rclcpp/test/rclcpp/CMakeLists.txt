@@ -653,3 +653,8 @@ function(test_subscription_content_filter_for_rmw_implementation)
   endif()
 endfunction()
 call_for_each_rmw_implementation(test_subscription_content_filter_for_rmw_implementation)
+
+ament_add_gtest(test_rcl_executor executors/test_rcl_executor.cpp)
+if(TARGET test_rcl_executor)
+  target_link_libraries(test_rcl_executor ${PROJECT_NAME})
+endif()

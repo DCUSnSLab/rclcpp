@@ -37,6 +37,7 @@
 
   <depend>libstatistics_collector</depend>
   <depend>rcl</depend>
+  <depend>rcl_executor</depend>
   <depend>rcl_logging_interface</depend>
   <depend>rcl_yaml_param_parser</depend>
   <depend>rcpputils</depend>
