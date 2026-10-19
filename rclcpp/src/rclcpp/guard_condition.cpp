@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <functional>
+#include <utility>
 
 #include "rclcpp/guard_condition.hpp"
 
@@ -73,16 +74,6 @@ GuardCondition::trigger()
   if (RCL_RET_OK != ret) {
     rclcpp::exceptions::throw_from_rcl_error(ret);
   }
-
-  {
-    std::lock_guard<std::recursive_mutex> lock(reentrant_mutex_);
-
-    if (on_trigger_callback_) {
-      on_trigger_callback_(1);
-    } else {
-      unread_count_++;
-    }
-  }
 }
 
 bool
@@ -116,15 +107,31 @@ GuardCondition::set_on_trigger_callback(std::function<void(size_t)> callback)
 {
   std::lock_guard<std::recursive_mutex> lock(reentrant_mutex_);
 
-  if (callback) {
-    on_trigger_callback_ = callback;
-
-    if (unread_count_) {
-      callback(unread_count_);
-      unread_count_ = 0;
+  const auto trampoline = [](const void * user_data, size_t count) {
+      try {
+        (*static_cast<const std::function<void(size_t)> *>(user_data))(count);
+      } catch (const std::exception & error) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("rclcpp"), "guard condition callback threw: %s", error.what());
+      } catch (...) {
+        RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "guard condition callback threw");
+      }
+    };
+  // Clearing waits for a callback running on another thread and keeps counting triggers, so
+  // the callable can be replaced safely and nothing triggered meanwhile is lost: rcl delivers
+  // the count when the new callable is registered.
+  rcl_ret_t ret = rcl_guard_condition_set_on_trigger_callback(
+    &rcl_guard_condition_, nullptr, nullptr);
+  if (RCL_RET_OK != ret) {
+    rclcpp::exceptions::throw_from_rcl_error(ret);
+  }
+  on_trigger_callback_ = std::move(callback);
+  if (on_trigger_callback_) {
+    ret = rcl_guard_condition_set_on_trigger_callback(
+      &rcl_guard_condition_, trampoline, &on_trigger_callback_);
+    if (RCL_RET_OK != ret) {
+      rclcpp::exceptions::throw_from_rcl_error(ret);
     }
-  } else {
-    on_trigger_callback_ = nullptr;
   }
 }
 

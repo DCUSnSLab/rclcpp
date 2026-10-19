@@ -111,7 +111,10 @@ public:
    *
    * Calling it again will clear any previously set callback.
    *
-   * This function is thread-safe.
+   * This function is thread-safe. Callbacks run synchronously on the triggering
+   * or registering thread and must not block. Calls made directly to
+   * rcl_trigger_guard_condition() are also reported. Triggers inside rmw, such
+   * as graph guard condition triggers, are not reported.
    *
    * If you want more information available in the callback, like the guard condition
    * or other information, you may use a lambda with captures or std::bind.

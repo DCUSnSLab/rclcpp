@@ -14,7 +14,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <memory>
+#include <thread>
 
 #include "rclcpp/rclcpp.hpp"
 
@@ -163,4 +165,54 @@ TEST_F(TestGuardCondition, callback_and_waitset) {
 
   EXPECT_EQ(rclcpp::WaitResultKind::Ready, wait_set.wait(std::chrono::seconds(1)).kind());
   EXPECT_EQ(c1.load(), 1u);
+}
+
+TEST_F(TestGuardCondition, raw_rcl_trigger_callback)
+{
+  auto gc = std::make_shared<rclcpp::GuardCondition>();
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&gc->get_rcl_guard_condition()));
+  size_t count = 0;
+  gc->set_on_trigger_callback([&count](size_t events) {count += events;});
+  EXPECT_EQ(1u, count);
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&gc->get_rcl_guard_condition()));
+  EXPECT_EQ(2u, count);
+  gc->trigger();
+  EXPECT_EQ(3u, count);
+  gc->set_on_trigger_callback(nullptr);
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&gc->get_rcl_guard_condition()));
+  EXPECT_EQ(3u, count);
+  gc->set_on_trigger_callback([&count](size_t events) {count += events;});
+  EXPECT_EQ(4u, count);
+}
+
+TEST_F(TestGuardCondition, mutable_trigger_callback)
+{
+  rclcpp::GuardCondition gc;
+  size_t observed = 0;
+  gc.set_on_trigger_callback([count = size_t{0}, &observed](size_t) mutable {
+      observed = ++count;
+    });
+  gc.trigger();
+  gc.trigger();
+  EXPECT_EQ(2u, observed);
+}
+
+TEST_F(TestGuardCondition, replacing_callback_while_triggering_loses_nothing)
+{
+  rclcpp::GuardCondition gc;
+  std::atomic<size_t> delivered{0};
+  std::atomic<bool> stop{false};
+  const size_t triggers = 200000;
+  std::thread setter([&] {
+      while (!stop) {
+        gc.set_on_trigger_callback([&delivered](size_t events) {delivered += events;});
+      }
+    });
+  for (size_t i = 0; i < triggers; ++i) {
+    gc.trigger();
+  }
+  stop = true;
+  setter.join();
+  gc.set_on_trigger_callback([&delivered](size_t events) {delivered += events;});
+  EXPECT_EQ(triggers, delivered.load());
 }

@@ -19,6 +19,7 @@
 #include <string>
 
 #include "rclcpp/experimental/executors/events_executor/events_executor.hpp"
+#include "rclcpp/executors/executor_notify_waitable.hpp"
 
 #include "test_msgs/srv/empty.hpp"
 #include "test_msgs/msg/empty.hpp"
@@ -489,4 +490,30 @@ TEST_F(TestEventsExecutor, test_default_incompatible_qos_callbacks)
     sub_log_msg);
 
   rcutils_logging_set_output_handler(original_output_handler);
+}
+
+TEST_F(TestEventsExecutor, rcl_guard_condition_in_waitable)
+{
+  auto node = std::make_shared<rclcpp::Node>("guard_waitable");
+  auto guard = std::make_shared<rclcpp::GuardCondition>();
+  size_t executions = 0;
+  auto waitable = std::make_shared<rclcpp::executors::ExecutorNotifyWaitable>(
+    [&executions]() {++executions;});
+  waitable->add_guard_condition(guard);
+  node->get_node_waitables_interface()->add_waitable(waitable, nullptr);
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard->get_rcl_guard_condition()));
+  EventsExecutor executor;
+  executor.add_node(node);
+  executor.spin_some();
+  EXPECT_EQ(1u, executions);
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard->get_rcl_guard_condition()));
+  executor.spin_some();
+  EXPECT_EQ(2u, executions);
+  guard->trigger();
+  executor.spin_some();
+  EXPECT_EQ(3u, executions);
+  executor.remove_node(node);
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard->get_rcl_guard_condition()));
+  executor.spin_some();
+  EXPECT_EQ(3u, executions);
 }

@@ -482,13 +482,6 @@ EventsExecutor::refresh_current_collection(
     },
     [](auto service) {service->clear_on_new_request_callback();});
 
-  // DO WE NEED THIS? WE ARE NOT DOING ANYTHING WITH GUARD CONDITIONS
-  /*
-  current_entities_collection_->guard_conditions.update(new_collection.guard_conditions,
-    [](auto guard_condition) {(void)guard_condition;},
-    [](auto guard_condition) {guard_condition->set_on_trigger_callback(nullptr);});
-  */
-
   current_entities_collection_->waitables.update(
     new_collection.waitables,
     [this](auto waitable) {
