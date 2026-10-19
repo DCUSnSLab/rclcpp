@@ -78,6 +78,26 @@ MultiThreadedExecutor::get_number_of_threads()
   return number_of_threads_;
 }
 
+bool
+MultiThreadedExecutor::left_out_of_wait(const rclcpp::AnyExecutable & any_exec)
+{
+  std::lock_guard guard{mutex_};
+  const auto & c = current_collection_;
+  if (any_exec.subscription) {
+    return !c.subscriptions.count(any_exec.subscription->get_subscription_handle().get());
+  }
+  if (any_exec.timer) {
+    return !c.timers.count(any_exec.timer->get_timer_handle().get());
+  }
+  if (any_exec.service) {
+    return !c.services.count(any_exec.service->get_service_handle().get());
+  }
+  if (any_exec.client) {
+    return !c.clients.count(any_exec.client->get_client_handle().get());
+  }
+  return any_exec.waitable && !c.waitables.count(any_exec.waitable.get());
+}
+
 void
 MultiThreadedExecutor::run(size_t this_thread_number)
 {
@@ -90,6 +110,11 @@ MultiThreadedExecutor::run(size_t this_thread_number)
         return;
       }
       if (!get_next_executable(any_exec, next_exec_timeout_)) {
+        // Woken with nothing this thread may run: the work is in groups other threads are
+        // running. Leave those out of the next wait, or it returns at once, over and over.
+        if (wait_result_ && wait_result_->kind() == WaitResultKind::Ready) {
+          entities_need_rebuild_.store(true);
+        }
         continue;
       }
     }
@@ -102,6 +127,9 @@ MultiThreadedExecutor::run(size_t this_thread_number)
     if (any_exec.callback_group &&
       any_exec.callback_group->type() == CallbackGroupType::MutuallyExclusive)
     {
+      if (left_out_of_wait(any_exec)) {
+        entities_need_rebuild_.store(true);
+      }
       try {
         interrupt_guard_condition_->trigger();
       } catch (const rclcpp::exceptions::RCLError & ex) {

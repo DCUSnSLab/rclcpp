@@ -533,7 +533,7 @@ endif()
 ament_add_gtest(test_multi_threaded_executor executors/test_multi_threaded_executor.cpp
   APPEND_LIBRARY_DIRS "${append_library_dirs}")
 if(TARGET test_multi_threaded_executor)
-  target_link_libraries(test_multi_threaded_executor ${PROJECT_NAME})
+  target_link_libraries(test_multi_threaded_executor ${PROJECT_NAME} ${test_msgs_TARGETS})
 endif()
 
 ament_add_gtest(test_events_cbg_executor_reentrant executors/test_events_cbg_executor_reentrant.cpp

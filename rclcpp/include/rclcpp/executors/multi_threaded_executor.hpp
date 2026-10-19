@@ -78,6 +78,10 @@ protected:
   void
   run(size_t this_thread_number);
 
+  /// Whether the entity was left out of the wait set while its group was being run.
+  bool
+  left_out_of_wait(const rclcpp::AnyExecutable & any_exec);
+
 private:
   RCLCPP_DISABLE_COPY(MultiThreadedExecutor)
 

@@ -14,14 +14,20 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/resource.h>
+
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <string>
 #include <memory>
+#include <thread>
 
 #include "rclcpp/exceptions.hpp"
 #include "rclcpp/node.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/executors.hpp"
+#include "test_msgs/msg/empty.hpp"
 
 using namespace std::chrono_literals;
 
@@ -96,4 +102,57 @@ TEST_F(TestMultiThreadedExecutor, timer_over_take) {
   auto timer = node->create_wall_timer(PERIOD_MS, timer_callback, cbg);
   executor.add_node(node);
   executor.spin();
+}
+
+/*
+   Test that the threads left waiting do not spin while a mutually exclusive subscription
+   callback runs and more messages for it are pending.
+ */
+TEST_F(TestMultiThreadedExecutor, no_busy_wait_while_exclusive_group_runs) {
+#ifdef __linux__
+  auto cpu_s = []() {
+      rusage u;
+      getrusage(RUSAGE_SELF, &u);
+      return u.ru_utime.tv_sec + u.ru_stime.tv_sec +
+             (u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6;
+    };
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2u);
+  auto node = std::make_shared<rclcpp::Node>("no_busy_wait");
+  std::atomic<int> count{0};
+  std::promise<void> second_started;
+  auto sub = node->create_subscription<test_msgs::msg::Empty>(
+    "no_busy_wait", rclcpp::QoS(10).reliable(), [&](test_msgs::msg::Empty::ConstSharedPtr) {
+      if (++count == 2) {
+        second_started.set_value();
+      }
+      std::this_thread::sleep_for(400ms);
+    });
+  auto pub = node->create_publisher<test_msgs::msg::Empty>(
+    "no_busy_wait", rclcpp::QoS(10).reliable());
+  executor.add_node(node);
+  std::thread spinner([&executor]() {executor.spin();});
+  auto end = std::chrono::steady_clock::now() + 5s;
+  while (pub->get_subscription_count() < 1 && std::chrono::steady_clock::now() < end) {
+    std::this_thread::sleep_for(10ms);
+  }
+  for (int i = 0; i < 3; ++i) {
+    pub->publish(test_msgs::msg::Empty());
+  }
+  // Each later callback starts as the group is released: measure while the second one runs
+  // and the third message waits.
+  ASSERT_EQ(std::future_status::ready, second_started.get_future().wait_for(5s));
+  std::this_thread::sleep_for(50ms);
+  double cpu = cpu_s();
+  std::this_thread::sleep_for(300ms);
+  cpu = cpu_s() - cpu;
+  end = std::chrono::steady_clock::now() + 5s;
+  while (count < 3 && std::chrono::steady_clock::now() < end) {
+    std::this_thread::sleep_for(10ms);
+  }
+  executor.cancel();
+  spinner.join();
+  EXPECT_EQ(3, count.load());
+  // A thread spinning on the pending message takes a whole core (0.3 s here).
+  EXPECT_LT(cpu, 0.09) << "cpu seconds used while the callback slept";
+#endif
 }
