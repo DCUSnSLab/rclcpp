@@ -51,3 +51,15 @@ NodeTimeSource::NodeTimeSource(
 
 NodeTimeSource::~NodeTimeSource()
 {}
+
+void
+NodeTimeSource::attachClock(rclcpp::node_interfaces::NodeClockInterface::SharedPtr node_clock)
+{
+  time_source_.attachClock(node_clock->get_clock());
+}
+
+void
+NodeTimeSource::detachClock(rclcpp::node_interfaces::NodeClockInterface::SharedPtr node_clock)
+{
+  time_source_.detachClock(node_clock->get_clock());
+}

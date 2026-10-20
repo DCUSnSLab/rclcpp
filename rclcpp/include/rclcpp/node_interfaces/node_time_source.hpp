@@ -56,6 +56,20 @@ public:
   virtual
   ~NodeTimeSource();
 
+  /// Let this time source also drive the clock of another node.
+  /**
+   * \sa rclcpp::NodeOptions::time_source
+   * \throws std::invalid_argument if sim time is active and the clock is not RCL_ROS_TIME.
+   */
+  RCLCPP_PUBLIC
+  void
+  attachClock(rclcpp::node_interfaces::NodeClockInterface::SharedPtr node_clock);
+
+  /// Stop driving a clock attached with attachClock().
+  RCLCPP_PUBLIC
+  void
+  detachClock(rclcpp::node_interfaces::NodeClockInterface::SharedPtr node_clock);
+
 private:
   RCLCPP_DISABLE_COPY(NodeTimeSource)
 

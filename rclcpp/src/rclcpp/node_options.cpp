@@ -14,15 +14,20 @@
 
 #include "rclcpp/node_options.hpp"
 
+#include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <utility>
 
 #include "rclcpp/detail/utilities.hpp"
 #include "rclcpp/exceptions.hpp"
 #include "rclcpp/logging.hpp"
+#include "rclcpp/node_interfaces/node_time_source.hpp"
 #include "rclcpp/publisher_options.hpp"
 #include "rclcpp/qos.hpp"
 
@@ -53,9 +58,66 @@ rcl_node_options_t_destructor(rcl_node_options_t * node_options)
 }
 }  // namespace detail
 
+namespace
+{
+// NodeOptions cannot get a member without breaking the ABI, so the time source is kept here,
+// keyed by instance. The destructor of NodeOptions is inline and cannot remove the entry:
+// constructors overwrite an entry left behind at a reused address, node destructors remove
+// the entry of their copy, and expired entries are dropped whenever one is added.
+struct TimeSourceTable
+{
+  std::mutex mutex;
+  std::unordered_map<const NodeOptions *,
+    std::weak_ptr<node_interfaces::NodeTimeSourceInterface>> entries;
+};
+
+TimeSourceTable &
+time_source_table()
+{
+  // Never destroyed, nodes may be destroyed during static destruction.
+  static auto * table = new TimeSourceTable;
+  return *table;
+}
+
+void
+set_time_source_entry(
+  const NodeOptions * options,
+  const std::weak_ptr<node_interfaces::NodeTimeSourceInterface> & time_source)
+{
+  auto & table = time_source_table();
+  std::lock_guard<std::mutex> lock(table.mutex);
+  if (time_source.expired()) {
+    table.entries.erase(options);
+    return;
+  }
+  for (auto it = table.entries.begin(); it != table.entries.end(); ) {
+    it = it->second.expired() ? table.entries.erase(it) : std::next(it);
+  }
+  table.entries[options] = time_source;
+}
+
+std::weak_ptr<node_interfaces::NodeTimeSourceInterface>
+get_time_source_entry(const NodeOptions * options)
+{
+  auto & table = time_source_table();
+  std::lock_guard<std::mutex> lock(table.mutex);
+  auto it = table.entries.find(options);
+  return it == table.entries.end() ?
+         std::weak_ptr<node_interfaces::NodeTimeSourceInterface>() : it->second;
+}
+}  // namespace
+
+void
+detail::release_time_source(const NodeOptions & options)
+{
+  set_time_source_entry(&options, {});
+}
+
 NodeOptions::NodeOptions(rcl_allocator_t allocator)
 : node_options_(nullptr, detail::rcl_node_options_t_destructor), allocator_(allocator)
-{}
+{
+  set_time_source_entry(this, {});
+}
 
 NodeOptions::NodeOptions(const NodeOptions & other)
 : node_options_(nullptr, detail::rcl_node_options_t_destructor)
@@ -88,6 +150,7 @@ NodeOptions::operator=(const NodeOptions & other)
     this->automatically_declare_parameters_from_overrides_ =
       other.automatically_declare_parameters_from_overrides_;
     this->allocator_ = other.allocator_;
+    set_time_source_entry(this, get_time_source_entry(&other));
   }
   return *this;
 }
@@ -394,6 +457,24 @@ NodeOptions::allocator(rcl_allocator_t allocator)
 {
   this->node_options_.reset();  // reset node options to make it be recreated on next access.
   this->allocator_ = allocator;
+  return *this;
+}
+
+rclcpp::node_interfaces::NodeTimeSourceInterface::SharedPtr
+NodeOptions::time_source() const
+{
+  return get_time_source_entry(this).lock();
+}
+
+NodeOptions &
+NodeOptions::time_source(rclcpp::node_interfaces::NodeTimeSourceInterface::SharedPtr time_source)
+{
+  if (time_source &&
+    !std::dynamic_pointer_cast<rclcpp::node_interfaces::NodeTimeSource>(time_source))
+  {
+    throw std::invalid_argument("time_source must be a rclcpp::node_interfaces::NodeTimeSource");
+  }
+  set_time_source_entry(this, time_source);
   return *this;
 }
 

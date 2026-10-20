@@ -213,17 +213,19 @@ Node::Node(
       options.allow_undeclared_parameters(),
       options.automatically_declare_parameters_from_overrides()
     )),
-  node_time_source_(new rclcpp::node_interfaces::NodeTimeSource(
-      node_base_,
-      node_topics_,
-      node_graph_,
-      node_services_,
-      node_logging_,
-      node_clock_,
-      node_parameters_,
-      options.clock_qos(),
-      options.use_clock_thread()
-    )),
+  node_time_source_(options.time_source() ? options.time_source() :
+    rclcpp::node_interfaces::NodeTimeSourceInterface::SharedPtr(
+      new rclcpp::node_interfaces::NodeTimeSource(
+        node_base_,
+        node_topics_,
+        node_graph_,
+        node_services_,
+        node_logging_,
+        node_clock_,
+        node_parameters_,
+        options.clock_qos(),
+        options.use_clock_thread()
+      ))),
   node_type_descriptions_(new rclcpp::node_interfaces::NodeTypeDescriptions(
       node_base_,
       node_logging_,
@@ -252,6 +254,12 @@ Node::Node(
 
   if (options.enable_logger_service()) {
     node_logging_->create_logger_services(node_services_);
+  }
+
+  // Last, so that a throwing constructor leaves no clock attached to a shared time source.
+  if (node_time_source_ == options.time_source()) {
+    std::static_pointer_cast<rclcpp::node_interfaces::NodeTimeSource>(node_time_source_)
+    ->attachClock(node_clock_);
   }
 }
 
@@ -296,6 +304,12 @@ Node::Node(
 
 Node::~Node()
 {
+  // The time source may be shared and outlive this node. Sub-nodes use the clock of their parent.
+  if (sub_namespace_.empty()) {
+    std::static_pointer_cast<rclcpp::node_interfaces::NodeTimeSource>(node_time_source_)
+    ->detachClock(node_clock_);
+  }
+  rclcpp::detail::release_time_source(node_options_);
   // release sub-interfaces in an order that allows them to consult with node_base during tear-down
   node_waitables_.reset();
   node_time_source_.reset();

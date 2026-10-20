@@ -447,6 +447,12 @@ if(TARGET test_time_source)
   target_link_libraries(test_time_source ${PROJECT_NAME} rcl::rcl)
 endif()
 
+ament_add_gtest(test_shared_time_source test_shared_time_source.cpp
+  APPEND_LIBRARY_DIRS "${append_library_dirs}" TIMEOUT 120)
+if(TARGET test_shared_time_source)
+  target_link_libraries(test_shared_time_source ${PROJECT_NAME} ${rosgraph_msgs_TARGETS})
+endif()
+
 ament_add_gtest(test_utilities test_utilities.cpp
   APPEND_LIBRARY_DIRS "${append_library_dirs}")
 if(TARGET test_utilities)

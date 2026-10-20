@@ -23,6 +23,7 @@
 #include "rcl/node_options.h"
 #include "rclcpp/context.hpp"
 #include "rclcpp/contexts/default_context.hpp"
+#include "rclcpp/node_interfaces/node_time_source_interface.hpp"
 #include "rclcpp/parameter.hpp"
 #include "rclcpp/publisher_options.hpp"
 #include "rclcpp/qos.hpp"
@@ -297,6 +298,7 @@ public:
   /// Set the clock QoS.
   /**
    * The QoS settings to be used for the publisher on /clock topic, if enabled.
+   * Ignored if a time source is set, see time_source().
    */
   RCLCPP_PUBLIC
   NodeOptions &
@@ -311,6 +313,7 @@ public:
   /// Set the use_clock_thread flag, return this for parameter idiom.
   /**
    * If true, a dedicated thread will be used to subscribe to "/clock" topic.
+   * Ignored if a time source is set, see time_source().
    */
   RCLCPP_PUBLIC
   NodeOptions &
@@ -416,6 +419,40 @@ public:
   NodeOptions &
   allocator(rcl_allocator_t allocator);
 
+  /// Return the time source to share, or nullptr if the node creates its own.
+  RCLCPP_PUBLIC
+  rclcpp::node_interfaces::NodeTimeSourceInterface::SharedPtr
+  time_source() const;
+
+  /// Set a time source to share with other nodes, return this for parameter idiom.
+  /**
+   * A node created with these options attaches its clock to this time source instead of
+   * creating its own, so several nodes in a process use one "/clock" subscription.
+   * The time source usually comes from Node::get_node_time_source_interface() or
+   * LifecycleNode::get_node_time_source_interface() of another node.
+   *
+   * - The node that created the time source decides for all nodes sharing it: its
+   *   "use_sim_time" parameter, clock QoS and use_clock_thread apply.
+   *   A node sharing it declares no "use_sim_time" parameter and ignores its own clock_qos()
+   *   and use_clock_thread().
+   * - If use_clock_thread is false on the node that created the time source, "/clock" is only
+   *   processed while that node is spun.
+   * - While sim time is active, the clock type of a sharing node must be RCL_ROS_TIME.
+   * - Each sharing node owns the time source until it is destroyed, and with it the node
+   *   interfaces of the node that created it. If that node is destroyed first, its "/clock"
+   *   subscription and its presence in the ROS graph remain until the last sharing node is
+   *   destroyed.
+   * - The options only keep a weak reference: if the time source no longer exists when a node
+   *   is created, that node creates its own.
+   *
+   * \param[in] time_source time source to share, or nullptr to let each node create its own.
+   * \throws std::invalid_argument if time_source is not a
+   *   rclcpp::node_interfaces::NodeTimeSource.
+   */
+  RCLCPP_PUBLIC
+  NodeOptions &
+  time_source(rclcpp::node_interfaces::NodeTimeSourceInterface::SharedPtr time_source);
+
 private:
   // This is mutable to allow for a const accessor which lazily creates the node options instance.
   /// Underlying rcl_node_options structure.
@@ -465,6 +502,14 @@ private:
 
   rcl_allocator_t allocator_ {rcl_get_default_allocator()};
 };
+
+namespace detail
+{
+/// Forget the time source set on this instance, called by the destructors of nodes.
+RCLCPP_PUBLIC
+void
+release_time_source(const NodeOptions & options);
+}  // namespace detail
 
 }  // namespace rclcpp
 

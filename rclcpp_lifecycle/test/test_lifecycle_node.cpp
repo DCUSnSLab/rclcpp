@@ -962,3 +962,42 @@ TEST_F(TestDefaultStateMachine, wait_for_graph_change)
     test_node->wait_for_graph_change(event, std::chrono::milliseconds(0)),
     rclcpp::exceptions::EventNotRegisteredError);
 }
+
+TEST_F(TestDefaultStateMachine, shared_time_source) {
+  // The time source handles changes of use_sim_time from /parameter_events.
+  auto set_use_sim_time = [](rclcpp::Node::SharedPtr node, bool value) {
+      EXPECT_TRUE(node->set_parameter(rclcpp::Parameter("use_sim_time", value)).successful);
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (node->get_clock()->ros_time_is_active() != value &&
+        std::chrono::steady_clock::now() < deadline)
+      {
+        rclcpp::spin_some(node);
+      }
+      return node->get_clock()->ros_time_is_active() == value;
+    };
+  auto source = std::make_shared<rclcpp::Node>(
+    "source", rclcpp::NodeOptions().append_parameter_override("use_sim_time", true));
+  auto lifecycle = std::make_shared<rclcpp_lifecycle::LifecycleNode>(
+    "sharing", rclcpp::NodeOptions().time_source(source->get_node_time_source_interface()));
+  EXPECT_EQ(lifecycle->get_node_time_source_interface(), source->get_node_time_source_interface());
+  EXPECT_FALSE(lifecycle->has_parameter("use_sim_time"));
+  EXPECT_TRUE(lifecycle->get_clock()->ros_time_is_active());
+
+  ASSERT_TRUE(set_use_sim_time(source, false));
+  EXPECT_FALSE(lifecycle->get_clock()->ros_time_is_active());
+
+  auto lifecycle_clock = lifecycle->get_clock();
+  lifecycle.reset();
+  ASSERT_TRUE(set_use_sim_time(source, true));
+  EXPECT_FALSE(lifecycle_clock->ros_time_is_active());
+
+  auto lifecycle_source = std::make_shared<rclcpp_lifecycle::LifecycleNode>(
+    "lifecycle_source",
+    rclcpp::NodeOptions().append_parameter_override("use_sim_time", true));
+  auto node = std::make_shared<rclcpp::Node>(
+    "node",
+    rclcpp::NodeOptions().time_source(lifecycle_source->get_node_time_source_interface()));
+  EXPECT_TRUE(node->get_clock()->ros_time_is_active());
+  lifecycle_source.reset();
+  EXPECT_TRUE(node->get_clock()->ros_time_is_active());
+}
