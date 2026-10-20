@@ -43,6 +43,8 @@ struct ExecutorCore::Impl
   struct Entity
   {
     uint64_t id = 0;
+    uint64_t order = UINT64_MAX;
+    std::weak_ptr<const void> object;
     CallbackGroup::WeakPtr group;
     std::shared_ptr<const void> handle;
     Clock::SharedPtr clock;
@@ -63,11 +65,13 @@ struct ExecutorCore::Impl
   std::unordered_map<const void *, std::shared_ptr<Entity>> entities;
   std::exception_ptr error;
   std::atomic<bool> stopped{false};
+  std::atomic<bool> dirty{true};
   bool partitioned = false;
   bool yield_before_execute = false;
   std::chrono::nanoseconds timeout{-1};
   ThreadStart thread_start;
   std::unordered_map<uint64_t, CallbackGroup::WeakPtr> known_groups;
+  std::vector<uint64_t> collected_busy{UINT64_MAX};
   std::unordered_map<uint64_t, std::shared_ptr<Entity>> sources;
 
   Impl(
@@ -87,6 +91,7 @@ struct ExecutorCore::Impl
       checked(rcl_executor_set_order(core, maintenance, UINT64_MAX));
     }
     owner.notify_waitable_->set_on_ready_callback([this](size_t, int) {
+        dirty = true;
         owner.entities_need_rebuild_ = true;
         auto result = rcl_executor_notify(core, maintenance, 1);
         if (result != RCL_RET_OK) {rcl_reset_error();}
@@ -113,6 +118,8 @@ struct ExecutorCore::Impl
   void sync()
   {
     std::lock_guard<std::mutex> lock(mutex);
+    dirty = false;
+    bool changed = false;
     std::unordered_set<const void *> seen;
     std::unordered_set<uint64_t> seen_groups;
     auto groups = owner.get_all_callback_groups();
@@ -129,18 +136,21 @@ struct ExecutorCore::Impl
           seen.insert(pointer.get());
           if (entities.count(pointer.get())) {return;}
           auto entity = std::make_shared<Entity>();
+          entity->object = pointer;
           entity->group = group;
           entity->handle = native_handle;
           entity->execute = execute;
           checked(rcl_executor_add(core, static_cast<rcl_executor_entity_type_t>(type),
               native_handle.get(), pointer.get(), group_id, &entity->id));
           entities.emplace(pointer.get(), entity);
+          changed = true;
         };
       std::function<void(const Waitable::SharedPtr &)> add_waitable;
       add_waitable = [&](const Waitable::SharedPtr & waitable) {
           seen.insert(waitable.get());
           if (entities.count(waitable.get())) {return;}
           auto entity = std::make_shared<Entity>();
+          entity->object = waitable;
           entity->group = group;
           entity->guard_only = !std::dynamic_pointer_cast<
             rclcpp::experimental::SubscriptionIntraProcessBase>(waitable) &&
@@ -193,6 +203,7 @@ struct ExecutorCore::Impl
               if (auto work = weak_waitable.lock()) {work->clear_on_ready_callback();}
             };
           entities.emplace(waitable.get(), entity);
+          changed = true;
           waitable->set_on_ready_callback([this, weak_entity](size_t count, int id) {
               auto e = weak_entity.lock();
               if (!e) {return;}
@@ -250,6 +261,7 @@ struct ExecutorCore::Impl
             });
         },
         [&](const TimerBase::SharedPtr & timer) {
+          if (entities.count(timer.get())) {seen.insert(timer.get()); return;}
           TimerBase::WeakPtr weak_timer = timer;
           // The core edits the jump callbacks of the timer's rcl clock, which rclcpp guards.
           std::lock_guard<std::mutex> clock_guard(timer->get_clock()->get_clock_mutex());
@@ -268,23 +280,37 @@ struct ExecutorCore::Impl
       if (it->second->clear) {it->second->clear();}
       remove(*it->second);
       it = entities.erase(it);
+      changed = true;
     }
     for (auto it = known_groups.begin(); it != known_groups.end(); ) {
       if (seen_groups.count(it->first)) {++it; continue;}
       checked(rcl_executor_remove_group(core, it->first));
       it = known_groups.erase(it);
     }
+    reorder(changed);
+  }
+
+  void reorder(bool changed)
+  {
     if (policy == RCL_EXECUTOR_WAIT_SET) {
       std::lock_guard<std::mutex> owner_lock(owner.mutex_);
+      // A rebuild changes slots only if entities or the groups it leaves out changed.
       if (owner.entities_need_rebuild_.exchange(false) || owner.current_collection_.empty()) {
-        owner.collect_entities();
+        auto busy = busy_groups();
+        if (changed || busy != collected_busy || owner.current_collection_.empty()) {
+          owner.collect_entities();
+          changed = true;
+          collected_busy = busy_groups() == busy ? busy : std::vector<uint64_t>{UINT64_MAX};
+        }
       }
+      if (!changed) {return;}
       auto order = [&](size_t count, auto get) {
           for (size_t i = 0; i < count; ++i) {
             auto pointer = get(i);
             auto found = entities.find(pointer.get());
-            if (found != entities.end()) {
+            if (found != entities.end() && found->second->order != i) {
               checked(rcl_executor_set_order(core, found->second->id, i));
+              found->second->order = i;
             }
           }
         };
@@ -295,6 +321,35 @@ struct ExecutorCore::Impl
       order(slots.size_of_clients(), [&](size_t i) {return slots.clients(i);});
       order(slots.size_of_waitables(), [&](size_t i) {return slots.waitables(i);});
     }
+  }
+
+  std::vector<uint64_t> busy_groups() const
+  {
+    std::vector<uint64_t> busy;
+    for (const auto & pair : known_groups) {
+      auto group = pair.second.lock();
+      if (group && !group->can_be_taken_from()) {busy.push_back(pair.first);}
+    }
+    std::sort(busy.begin(), busy.end());
+    return busy;
+  }
+
+  // Entity destruction sends no notification; anything else that changes the collection does.
+  void refresh(bool expiry)
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      bool expired = expiry && (
+        std::any_of(entities.begin(), entities.end(),
+        [](const auto & pair) {return pair.second->object.expired();}) ||
+        std::any_of(known_groups.begin(), known_groups.end(),
+        [](const auto & pair) {return pair.second.expired();}));
+      if (!dirty && !expired) {
+        reorder(false);
+        return;
+      }
+    }
+    sync();
   }
 
   bool execute(const rcl_executor_item_t & item)
@@ -337,11 +392,11 @@ struct ExecutorCore::Impl
               std::unique_lock<std::mutex> selection(selection_mutex);
               auto status = rcl_executor_next(core, &item);
               if (status == RCL_EXECUTOR_TIMEOUT) {
-                sync();
+                refresh(true);
                 status = rcl_executor_wait(core, timeout.count());
                 if (status == RCL_EXECUTOR_STOPPED) {return;}
                 if (status == RCL_EXECUTOR_ERROR) {checked(RCL_RET_ERROR);}
-                if (owner.entities_need_rebuild_) {sync();}
+                refresh(false);
                 status = rcl_executor_next(core, &item);
                 if (status == RCL_EXECUTOR_TIMEOUT) {
                   owner.entities_need_rebuild_ = true;
@@ -501,7 +556,7 @@ void ExecutorCore::spin_once(std::chrono::nanoseconds timeout)
     }
     if (status == RCL_EXECUTOR_ERROR) {rclcpp::exceptions::throw_from_rcl_error(RCL_RET_ERROR);}
     if (status == RCL_EXECUTOR_STOPPED || waited) {return;}
-    impl_->sync();
+    impl_->refresh(true);
     auto remaining = timeout;
     if (timeout.count() > 0) {
       remaining = std::max(std::chrono::nanoseconds(0), timeout -
@@ -511,7 +566,7 @@ void ExecutorCore::spin_once(std::chrono::nanoseconds timeout)
     status = rcl_executor_wait(impl_->core, remaining.count());
     if (status == RCL_EXECUTOR_ERROR) {rclcpp::exceptions::throw_from_rcl_error(RCL_RET_ERROR);}
     if (status == RCL_EXECUTOR_STOPPED) {return;}
-    if (impl_->owner.entities_need_rebuild_) {impl_->sync();}
+    impl_->refresh(false);
     waited = true;
   }
 }
@@ -524,7 +579,7 @@ void ExecutorCore::drain(std::chrono::nanoseconds duration, bool exhaustive)
   }
   RCPPUTILS_SCOPE_EXIT(impl_->owner.spinning = false; rcl_executor_reset(impl_->core););
   rcl_executor_reset(impl_->core);
-  impl_->sync();
+  impl_->refresh(true);
   auto start = std::chrono::steady_clock::now();
   std::vector<uint64_t> visited;
   while (impl_->owner.spinning && rclcpp::ok(impl_->owner.context_) && duration.count() >= 0) {
@@ -535,7 +590,7 @@ void ExecutorCore::drain(std::chrono::nanoseconds duration, bool exhaustive)
       impl_->policy == RCL_EXECUTOR_WAIT_SET &&
       rcl_executor_wait(impl_->core, 0) == RCL_EXECUTOR_READY)
     {
-      impl_->sync();
+      impl_->refresh(false);
       continue;
     }
     if (status != RCL_EXECUTOR_READY) {break;}
