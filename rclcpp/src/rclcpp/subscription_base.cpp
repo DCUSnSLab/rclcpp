@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "rcpputils/scope_exit.hpp"
@@ -94,6 +95,18 @@ SubscriptionBase::SubscriptionBase(
 
 SubscriptionBase::~SubscriptionBase()
 {
+  // A loaned message can keep the rcl subscription alive after this object is gone.
+  try {
+    clear_on_new_message_callback();
+  } catch (const std::exception & exception) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("rclcpp"),
+      "Failed to clear the on new message callback of a subscription: %s", exception.what());
+  } catch (...) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("rclcpp"),
+      "Failed to clear the on new message callback of a subscription");
+  }
   if (!use_intra_process_) {
     return;
   }
@@ -301,20 +314,7 @@ SubscriptionBase::setup_intra_process(
 bool
 SubscriptionBase::can_loan_messages() const
 {
-  bool retval = rcl_subscription_can_loan_messages(subscription_handle_.get());
-  if (retval) {
-    // TODO(clalancette): The loaned message interface is currently not safe to use with
-    // shared_ptr callbacks.  If a user takes a copy of the shared_ptr, it can get freed from
-    // underneath them via rcl_return_loaned_message_from_subscription().  The correct solution is
-    // to return the loaned message in a custom deleter, but that needs to be carefully handled
-    // with locking.  Warn the user about this until we fix it.
-    RCLCPP_WARN_ONCE(
-      this->node_logger_,
-      "Loaned messages are only safe with const ref subscription callbacks. "
-      "If you are using any other kind of subscriptions, "
-      "set the ROS_DISABLE_LOANED_MESSAGES environment variable to 1 (the default).");
-  }
-  return retval;
+  return rcl_subscription_can_loan_messages(subscription_handle_.get());
 }
 
 rclcpp::Waitable::SharedPtr
@@ -549,4 +549,11 @@ SubscriptionBase::take_dynamic_message(
 {
   throw std::runtime_error("Unimplemented");
   return false;
+}
+
+bool
+rclcpp::detail::exchange_loaned_message_owned(bool owned)
+{
+  static thread_local bool loaned_message_owned = false;
+  return std::exchange(loaned_message_owned, owned);
 }

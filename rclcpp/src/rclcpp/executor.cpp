@@ -569,6 +569,25 @@ Executor::execute_subscription(rclcpp::SubscriptionBase::SharedPtr subscription)
           // inter-process communication, given to the user for their callback,
           // and then returned.
           void * loaned_msg = nullptr;
+          const bool outer_owned = rclcpp::detail::exchange_loaned_message_owned(false);
+          auto return_unowned_loan = rcpputils::make_scope_exit(
+            [&]() {
+              const bool owned = rclcpp::detail::exchange_loaned_message_owned(outer_owned);
+              // Subscriptions compiled against older headers leave the loan to the executor.
+              if (nullptr == loaned_msg || owned) {
+                return;
+              }
+              rcl_ret_t ret = rcl_return_loaned_message_from_subscription(
+                subscription->get_subscription_handle().get(), loaned_msg);
+              if (RCL_RET_OK != ret) {
+                RCLCPP_ERROR(
+                  rclcpp::get_logger("rclcpp"),
+                  "rcl_return_loaned_message_from_subscription() failed for subscription on "
+                  "topic '%s': %s",
+                  subscription->get_topic_name(), rcl_get_error_string().str);
+                rcl_reset_error();
+              }
+            });
           // TODO(wjwwood): refactor this into methods on subscription when LoanedMessage
           //   is extened to support subscriptions as well.
           take_and_do_error_handling(
@@ -589,18 +608,6 @@ Executor::execute_subscription(rclcpp::SubscriptionBase::SharedPtr subscription)
               return true;
             },
             [&]() {subscription->handle_loaned_message(loaned_msg, message_info);});
-          if (nullptr != loaned_msg) {
-            rcl_ret_t ret = rcl_return_loaned_message_from_subscription(
-              subscription->get_subscription_handle().get(), loaned_msg);
-            if (RCL_RET_OK != ret) {
-              RCLCPP_ERROR(
-                rclcpp::get_logger("rclcpp"),
-                "rcl_return_loaned_message_from_subscription() failed for subscription on topic "
-                "'%s': %s",
-                subscription->get_topic_name(), rcl_get_error_string().str);
-            }
-            loaned_msg = nullptr;
-          }
         } else {
           // This case is taking a copy of the message data from the middleware via
           // inter-process communication.

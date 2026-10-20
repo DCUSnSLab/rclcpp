@@ -679,6 +679,23 @@ private:
     std::atomic<bool>> qos_events_in_use_by_wait_set_;
 };
 
+namespace detail
+{
+
+/// Set whether the loaned message taken on this thread is now owned by its shared_ptr.
+/**
+ * Subscription::handle_loaned_message() sets it, and the shared_ptr deleter returns the loan.
+ * The executor returns the loan itself when it stays unset, which is the case for subscriptions
+ * compiled against headers that predate this function.
+ *
+ * \return the previous value
+ */
+RCLCPP_PUBLIC
+bool
+exchange_loaned_message_owned(bool owned);
+
+}  // namespace detail
+
 }  // namespace rclcpp
 
 #endif  // RCLCPP__SUBSCRIPTION_BASE_HPP_
