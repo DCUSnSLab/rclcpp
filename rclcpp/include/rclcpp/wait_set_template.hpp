@@ -37,6 +37,7 @@
 
 namespace rclcpp
 {
+class ExecutorCore;
 namespace experimental::executors
 {
 class RclExecutor;
@@ -52,6 +53,7 @@ class WaitSetTemplate final : private SynchronizationPolicy, private StoragePoli
 {
   // The event-driven executor must preserve these slots without invoking rcl_wait.
   friend class experimental::executors::RclExecutor;
+  friend class ExecutorCore;
 
 public:
   RCLCPP_SMART_PTR_DEFINITIONS_NOT_COPYABLE(WaitSetTemplate)

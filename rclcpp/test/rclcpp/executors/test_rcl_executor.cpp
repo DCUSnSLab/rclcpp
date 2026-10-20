@@ -96,12 +96,16 @@ public:
   rclcpp::Client<Service>::SharedPtr client, peer_client;
   int requests = 0;
   bool arrivals;
+  enum class Drive {Spin, SpinOnce, Future} drive = Drive::Spin;
+  std::promise<void> finished;
   rclcpp::Executor * active = nullptr;
 
   void record(const std::string & name)
   {
     sequence.push_back(name);
-    if (sequence.size() == (arrivals ? 14u : 12u)) {active->cancel();}
+    if (sequence.size() == (arrivals ? 14u : 12u)) {
+      if (drive == Drive::Future) {finished.set_value();} else {active->cancel();}
+    }
   }
 
   PolicyScenario(bool two_groups, bool inject)
@@ -181,14 +185,24 @@ public:
     for (auto & timer : timers) {timer->reset();}
     waitable->trigger();
     const size_t expected = arrivals ? 14 : 12;
-    std::promise<void> done;
-    auto future = done.get_future();
-    std::thread watchdog([&] {
-        if (future.wait_for(2s) == std::future_status::timeout) {executor.cancel();}
-      });
-    executor.spin();
-    done.set_value();
-    watchdog.join();
+    if (drive == Drive::Future) {
+      finished = std::promise<void>();
+      executor.spin_until_future_complete(finished.get_future(), 2s);
+    } else if (drive == Drive::SpinOnce) {
+      auto until = std::chrono::steady_clock::now() + 2s;
+      while (sequence.size() < expected && std::chrono::steady_clock::now() < until) {
+        executor.spin_once(50ms);
+      }
+    } else {
+      std::promise<void> done;
+      auto future = done.get_future();
+      std::thread watchdog([&] {
+          if (future.wait_for(2s) == std::future_status::timeout) {executor.cancel();}
+        });
+      executor.spin();
+      done.set_value();
+      watchdog.join();
+    }
     EXPECT_EQ(expected, sequence.size());
     executor.remove_node(node);
     peer_executor.spin_some();
@@ -216,6 +230,108 @@ void compare_policy(bool arrivals)
   rclcpp::shutdown();
 }
 }  // namespace
+
+namespace
+{
+// Restores ROS_EXECUTOR_CORE when the test ends.
+class CoreSwitch
+{
+public:
+  CoreSwitch()
+  : had_(std::getenv("ROS_EXECUTOR_CORE") != nullptr),
+    saved_(had_ ? std::getenv("ROS_EXECUTOR_CORE") : "") {}
+  ~CoreSwitch()
+  {
+    if (had_) {set(saved_.c_str());} else {set(nullptr);}
+  }
+  void set(const char * value)
+  {
+    if (value) {setenv("ROS_EXECUTOR_CORE", value, 1);} else {unsetenv("ROS_EXECUTOR_CORE");}
+  }
+
+private:
+  bool had_;
+  std::string saved_;
+};
+
+void compare_default_executor(bool arrivals, PolicyScenario::Drive drive)
+{
+  CoreSwitch core;
+  core.set(nullptr);
+  rclcpp::init(0, nullptr);
+  {
+    PolicyScenario scenario(true, arrivals);
+    scenario.drive = drive;
+    rclcpp::executors::SingleThreadedExecutor reference;
+    core.set("1");
+    rclcpp::executors::SingleThreadedExecutor candidate;
+    core.set(nullptr);
+    for (int repeat = 0; repeat < 20; ++repeat) {
+      SCOPED_TRACE(repeat);
+      EXPECT_EQ(scenario.run(reference), scenario.run(candidate));
+    }
+  }
+  rclcpp::shutdown();
+}
+}  // namespace
+
+TEST(RclExecutorDefault, single_threaded_backlogs)
+{
+  compare_default_executor(false, PolicyScenario::Drive::Spin);
+}
+
+TEST(RclExecutorDefault, single_threaded_arrivals_during_callback)
+{
+  compare_default_executor(true, PolicyScenario::Drive::Spin);
+}
+
+TEST(RclExecutorDefault, single_threaded_spin_once_backlogs)
+{
+  compare_default_executor(false, PolicyScenario::Drive::SpinOnce);
+}
+
+TEST(RclExecutorDefault, single_threaded_future_backlogs)
+{
+  compare_default_executor(false, PolicyScenario::Drive::Future);
+}
+
+TEST(RclExecutorDefault, single_threaded_spin_once_arrivals_during_callback)
+{
+  compare_default_executor(true, PolicyScenario::Drive::SpinOnce);
+}
+
+TEST(RclExecutorDefault, single_threaded_future_arrivals_during_callback)
+{
+  compare_default_executor(true, PolicyScenario::Drive::Future);
+}
+
+// rclcpp::spin_some(node) builds a new executor per call; samples announced to the previous
+// executor's readiness callback must still reach the next one.
+TEST(RclExecutorDefault, temporary_executors_keep_unconsumed_messages)
+{
+  CoreSwitch core;
+  core.set("1");
+  rclcpp::init(0, nullptr);
+  {
+    auto node = std::make_shared<rclcpp::Node>("temporary_executors");
+    int received = 0;
+    auto sub = node->create_subscription<Message>("temporary_executors", 10,
+        [&](Message::ConstSharedPtr) {++received;});
+    auto pub = node->create_publisher<Message>("temporary_executors", 10);
+    rclcpp::spin_some(node);
+    for (int i = 0; i < 3; ++i) {
+      pub->publish(Message());
+    }
+    auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (sub->get_publisher_count() == 0 && std::chrono::steady_clock::now() < deadline) {}
+    std::this_thread::sleep_for(100ms);
+    for (int i = 0; i < 3; ++i) {
+      rclcpp::spin_some(node);
+    }
+    EXPECT_EQ(3, received);
+  }
+  rclcpp::shutdown();
+}
 
 TEST(RclExecutorPolicy, single_threaded_backlogs)
 {

@@ -32,6 +32,7 @@
 #include "rclcpp/dynamic_typesupport/dynamic_message.hpp"
 #include "rclcpp/exceptions.hpp"
 #include "rclcpp/executor.hpp"
+#include "executor_implementation.hpp"
 #include "rclcpp/guard_condition.hpp"
 #include "rclcpp/node.hpp"
 #include "rclcpp/utilities.hpp"
@@ -48,7 +49,6 @@ using rclcpp::Executor;
 /// The events and intraprocess waitable are already added via the callback group.
 static constexpr rclcpp::SubscriptionWaitSetMask kDefaultSubscriptionMask = {true, false, false};
 
-class rclcpp::ExecutorImplementation {};
 
 Executor::Executor(const std::shared_ptr<rclcpp::Context> & context)
 : spinning(false),
@@ -91,6 +91,7 @@ Executor::Executor(const rclcpp::ExecutorOptions & options)
 
 Executor::~Executor()
 {
+  impl_.reset();
   std::lock_guard<std::mutex> guard(mutex_);
 
   notify_waitable_->remove_guard_condition(interrupt_guard_condition_);
@@ -140,6 +141,7 @@ Executor::trigger_entity_recollect(bool notify)
     this->collect_entities();
   }
 
+  if (impl_ && impl_->core) {impl_->core->sync();}
   if (notify) {
     interrupt_guard_condition_->trigger();
   }
@@ -277,7 +279,11 @@ Executor::spin_until_future_complete_impl(
   if (spinning.exchange(true)) {
     throw std::runtime_error("spin_until_future_complete() called while already spinning");
   }
-  RCPPUTILS_SCOPE_EXIT(wait_result_.reset();this->spinning.store(false););
+  RCPPUTILS_SCOPE_EXIT(
+    wait_result_.reset();
+    if (impl_ && impl_->core) {impl_->core->end_round();}
+    this->spinning.store(false);
+  );
   while (rclcpp::ok(this->context_) && spinning.load()) {
     // Do one item of work.
     spin_once_impl(timeout_left);
@@ -350,6 +356,7 @@ void Executor::spin_all(std::chrono::nanoseconds max_duration)
 void
 Executor::spin_some_impl(std::chrono::nanoseconds max_duration, bool exhaustive)
 {
+  if (impl_ && impl_->core) {return impl_->core->drain(max_duration, exhaustive);}
   auto start = std::chrono::steady_clock::now();
   auto max_duration_not_elapsed = [max_duration, start]() {
       if (std::chrono::nanoseconds(0) == max_duration) {
@@ -436,6 +443,7 @@ Executor::spin_some_impl(std::chrono::nanoseconds max_duration, bool exhaustive)
 void
 Executor::spin_once_impl(std::chrono::nanoseconds timeout)
 {
+  if (impl_ && impl_->core) {return impl_->core->spin_once(timeout);}
   AnyExecutable any_exec;
   if (get_next_executable(any_exec, timeout)) {
     execute_any_executable(any_exec);
@@ -448,13 +456,18 @@ Executor::spin_once(std::chrono::nanoseconds timeout)
   if (spinning.exchange(true)) {
     throw std::runtime_error("spin_once() called while already spinning");
   }
-  RCPPUTILS_SCOPE_EXIT(wait_result_.reset();this->spinning.store(false););
+  RCPPUTILS_SCOPE_EXIT(
+    wait_result_.reset();
+    if (impl_ && impl_->core) {impl_->core->end_round();}
+    this->spinning.store(false);
+  );
   spin_once_impl(timeout);
 }
 
 void
 Executor::cancel()
 {
+  if (impl_ && impl_->core) {return impl_->core->cancel();}
   spinning.store(false);
   try {
     interrupt_guard_condition_->trigger();

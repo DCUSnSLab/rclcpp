@@ -595,6 +595,8 @@ protected:
 
   /// Pointer to implementation
   std::unique_ptr<ExecutorImplementation> impl_;
+
+  friend class ExecutorCore;
 };
 
 }  // namespace rclcpp

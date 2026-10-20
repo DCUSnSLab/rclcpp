@@ -16,17 +16,24 @@
 
 #include "rclcpp/executors/single_threaded_executor.hpp"
 #include "rclcpp/any_executable.hpp"
+#include "../executor_implementation.hpp"
 
 using rclcpp::executors::SingleThreadedExecutor;
 
 SingleThreadedExecutor::SingleThreadedExecutor(const rclcpp::ExecutorOptions & options)
-: rclcpp::Executor(options) {}
+: rclcpp::Executor(options)
+{
+  if (rclcpp::executor_core_requested()) {
+    impl_->core = std::make_unique<rclcpp::ExecutorCore>(*this, 1, RCL_EXECUTOR_WAIT_SET);
+  }
+}
 
 SingleThreadedExecutor::~SingleThreadedExecutor() {}
 
 void
 SingleThreadedExecutor::spin()
 {
+  if (impl_->core) {return impl_->core->spin();}
   if (spinning.exchange(true)) {
     throw std::runtime_error("spin() called while already spinning");
   }

@@ -23,6 +23,7 @@
 
 #include "rclcpp/logging.hpp"
 #include "rclcpp/utilities.hpp"
+#include "../executor_implementation.hpp"
 
 using rclcpp::executors::MultiThreadedExecutor;
 
@@ -39,6 +40,12 @@ MultiThreadedExecutor::MultiThreadedExecutor(
     number_of_threads :
     std::max(std::thread::hardware_concurrency(), 2U);
 
+  if (rclcpp::executor_core_requested()) {
+    impl_->core = std::make_unique<rclcpp::ExecutorCore>(*this, number_of_threads_,
+      RCL_EXECUTOR_WAIT_SET);
+    impl_->core->configure(yield_before_execute_, next_exec_timeout_);
+  }
+
   if (number_of_threads_ == 1) {
     RCLCPP_WARN(
       rclcpp::get_logger("rclcpp"),
@@ -52,6 +59,7 @@ MultiThreadedExecutor::~MultiThreadedExecutor() {}
 void
 MultiThreadedExecutor::spin()
 {
+  if (impl_->core) {return impl_->core->spin();}
   if (spinning.exchange(true)) {
     throw std::runtime_error("spin() called while already spinning");
   }
