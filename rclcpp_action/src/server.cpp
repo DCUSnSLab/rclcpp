@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <inttypes.h>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -89,6 +90,8 @@ public:
 
   std::recursive_mutex expire_thread_reentrant_mutex_;
   std::thread expire_thread;
+  std::condition_variable expire_dispatched;
+  const rcl_timer_t * expire_timer_ = nullptr;
 
   // must be a class member, so keep it in scope
   std::function<void(size_t)> expire_reset_callback;
@@ -110,7 +113,12 @@ public:
         terminate_expire_thread = true;
       }
       expire_cv->notify_one();
+      expire_dispatched.notify_one();
       expire_thread.join();
+      auto ret = rcl_timer_set_on_reset_callback(expire_timer_, nullptr, nullptr);
+      if (ret != RCL_RET_OK) {
+        rclcpp::exceptions::throw_from_rcl_error(ret, "Failed to clear timer on reset callback");
+      }
       expire_reset_callback = std::function<void(size_t)>();
       expire_cv.reset();
     }
@@ -148,6 +156,7 @@ public:
 
     // extract the timer from the wait set
     const rcl_timer_t *expire_timer = wait_set.timers[0];
+    expire_timer_ = expire_timer;
 
     // don't need the wait set any more
     ret = rcl_wait_set_fini(&wait_set);
@@ -206,17 +215,13 @@ public:
 
             bool is_ready = false;
             if(rcl_timer_is_ready(expire_timer, &is_ready) == RCL_RET_OK && is_ready) {
-              // we need to cancel the timer here, to avoid a endless loop
-              // in case a new goal expires, the timer will be reset.
-              auto ret2 = rcl_timer_cancel(const_cast<rcl_timer_t *>(expire_timer));
-              if(ret2 != RCL_RET_OK) {
-                rclcpp::exceptions::throw_from_rcl_error(ret2, "Failed to cancel timer");
-              }
-
-              std::lock_guard<std::recursive_mutex> lock(expire_thread_reentrant_mutex_);
               if(expire_ready_callback) {
                 expire_ready_callback(1, static_cast<int>(ServerBase::EntityType::Expired));
               }
+              std::unique_lock<std::mutex> lock(expire_cv->mutex());
+              expire_dispatched.wait(lock, [this] {
+                return expire_time_changed || terminate_expire_thread;
+                });
             }
           }
       });
@@ -783,6 +788,15 @@ ServerBase::execute_check_expired_goals()
       pimpl_->result_requests_.erase(uuid);
       pimpl_->goal_handles_.erase(uuid);
     }
+  }
+  std::lock_guard<std::recursive_mutex> lock(pimpl_->expire_thread_reentrant_mutex_);
+  if (pimpl_->expire_cv) {
+    {
+      std::lock_guard<std::mutex> guard(pimpl_->expire_cv->mutex());
+      pimpl_->expire_time_changed = true;
+    }
+    pimpl_->expire_cv->notify_one();
+    pimpl_->expire_dispatched.notify_one();
   }
 }
 

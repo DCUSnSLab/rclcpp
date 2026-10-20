@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "gtest/gtest.h"
 
 #include "rclcpp/exceptions.hpp"
+#include "rclcpp/experimental/executors/rcl_executor.hpp"
 #include "rclcpp/node.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rcpputils/scope_exit.hpp"
@@ -25,6 +28,7 @@
 
 #include "rcl_action/action_server.h"
 #include "rcl_action/wait.h"
+#include "rclcpp_action/create_client.hpp"
 #include "rclcpp_action/create_server.hpp"
 #include "rclcpp_action/server.hpp"
 #include "mocking_utils/patch.hpp"
@@ -1341,4 +1345,44 @@ TEST_F(TestDeadlockServer, deadlock_while_succeed_and_canceled)
   // current goal handle is not cancelable, so it returns ERROR_REJECTED
   EXPECT_EQ(CancelResponse::ERROR_REJECTED, response_ptr->return_code);
   t.join();
+}
+
+TEST(WaitSetAction, result_expires_after_dispatch)
+{
+  using namespace std::chrono_literals;
+  using Action = test_msgs::action::Fibonacci;
+  rclcpp::init(0, nullptr);
+  {
+    auto node = std::make_shared<rclcpp::Node>("wait_set_expiry");
+    auto options = rcl_action_server_get_default_options();
+    options.result_timeout.nanoseconds = 20000000;
+    auto server = rclcpp_action::create_server<Action>(node, "expiry",
+        [](const auto &, const auto &) {return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;},
+        [](const auto &) {return rclcpp_action::CancelResponse::ACCEPT;},
+        [](auto goal) {goal->succeed(std::make_shared<Action::Result>());}, options);
+    auto client = rclcpp_action::create_client<Action>(node, "expiry");
+    ASSERT_TRUE(client->wait_for_action_server(2s));
+    rclcpp::experimental::executors::RclExecutor executor(
+      rclcpp::ExecutorOptions(), 1, RCL_EXECUTOR_WAIT_SET);
+    executor.add_node(node);
+    auto sent = client->async_send_goal(Action::Goal());
+    ASSERT_EQ(rclcpp::FutureReturnCode::SUCCESS, executor.spin_until_future_complete(sent, 2s));
+    auto goal = sent.get();
+    ASSERT_NE(nullptr, goal);
+    auto result = client->async_get_result(goal);
+    ASSERT_EQ(rclcpp::FutureReturnCode::SUCCESS, executor.spin_until_future_complete(result, 2s));
+    ASSERT_EQ(rclcpp_action::ResultCode::SUCCEEDED, result.get().code);
+    std::this_thread::sleep_for(40ms);
+    executor.spin_some();
+    auto raw = node->create_client<Action::Impl::GetResultService>("expiry/_action/get_result");
+    ASSERT_TRUE(raw->wait_for_service(2s));
+    auto request = std::make_shared<Action::Impl::GetResultService::Request>();
+    request->goal_id.uuid = goal->get_goal_id();
+    auto expired = raw->async_send_request(request);
+    ASSERT_EQ(rclcpp::FutureReturnCode::SUCCESS,
+      executor.spin_until_future_complete(expired, 2s));
+    EXPECT_EQ(action_msgs::msg::GoalStatus::STATUS_UNKNOWN, expired.get()->status);
+    executor.remove_node(node);
+  }
+  rclcpp::shutdown();
 }
