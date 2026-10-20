@@ -68,6 +68,11 @@ ament_add_gtest(test_copy_all_parameter_values test_copy_all_parameter_values.cp
 if(TARGET test_copy_all_parameter_values)
   target_link_libraries(test_copy_all_parameter_values ${PROJECT_NAME})
 endif()
+ament_add_gtest(test_callback_group test_callback_group.cpp)
+if(TARGET test_callback_group)
+  target_link_libraries(test_callback_group ${PROJECT_NAME})
+endif()
+
 ament_add_gtest(test_create_timer test_create_timer.cpp)
 if(TARGET test_create_timer)
   target_link_libraries(test_create_timer ${PROJECT_NAME})
