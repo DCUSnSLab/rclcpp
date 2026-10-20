@@ -28,6 +28,11 @@ from rclpy.executors import SingleThreadedExecutor
 from sensor_msgs.msg import Image
 
 
+def count42(data):
+    """Count payload bytes in array.array or opt-in NumPy fields."""
+    return data.count(42) if hasattr(data, 'count') else int((data == 42).sum())
+
+
 def main():
     """Check payloads and measure all typed language pairs through ordinary APIs."""
     parser = argparse.ArgumentParser()
@@ -56,7 +61,7 @@ def main():
         elapsed = time.monotonic_ns() - (
             message.header.stamp.sec * 10**9 + message.header.stamp.nanosec)
         assert len(message.data) == args.bytes
-        assert message.data.count(42) == args.bytes
+        assert count42(message.data) == args.bytes
         seen.append(message.height)
         latencies.append(elapsed / 1000)
         if message.height == 9:
@@ -108,7 +113,7 @@ def main():
     counter.memcount_pause()
     if args.pair[1] == 'p':
         assert seen == list(range(10 + args.samples)), seen
-        assert retained[0].height == 9 and retained[0].data.count(42) == args.bytes
+        assert retained[0].height == 9 and count42(retained[0].data) == args.bytes
     else:
         assert native.count() == 10 + args.samples
     ctypes.CDLL(None).memcount_stop()
