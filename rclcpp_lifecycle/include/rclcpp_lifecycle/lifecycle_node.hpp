@@ -436,6 +436,29 @@ public:
       std::pair<ParameterT, rcl_interfaces::msg::ParameterDescriptor>
     > & parameters);
 
+  /// Declare and initialize several parameters as one change.
+  /**
+   * \sa rclcpp::Node::declare_parameters_atomically
+   */
+  RCLCPP_LIFECYCLE_PUBLIC
+  std::vector<rclcpp::ParameterValue>
+  declare_parameters_atomically(
+    const std::string & namespace_,
+    const std::vector<rclcpp::Parameter> & parameters,
+    bool ignore_overrides = false);
+
+  /// Declare and initialize several parameters with descriptors as one change.
+  /**
+   * \sa rclcpp::Node::declare_parameters_atomically
+   */
+  RCLCPP_LIFECYCLE_PUBLIC
+  std::vector<rclcpp::ParameterValue>
+  declare_parameters_atomically(
+    const std::string & namespace_,
+    const std::vector<std::pair<rclcpp::Parameter, rcl_interfaces::msg::ParameterDescriptor>> &
+    parameters,
+    bool ignore_overrides = false);
+
   /// Undeclare a previously declared parameter.
   /**
    * \sa rclcpp::Node::undeclare_parameter

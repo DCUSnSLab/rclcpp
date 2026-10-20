@@ -587,6 +587,57 @@ public:
     > & parameters,
     bool ignore_overrides = false);
 
+  /// Declare and initialize several parameters as one change.
+  /**
+   * Unlike declare_parameters(), the parameters are declared all or none, and one
+   * rcl_interfaces::msg::ParameterEvent lists all of them instead of one event per parameter.
+   * Use it to declare many parameters at startup without flooding "/parameter_events".
+   *
+   * Each parameter is declared like declare_parameter() with its name prefixed by
+   * "namespace_." (no prefix if namespace_ is empty), the value as default value and the type
+   * of that value as type, or a dynamic type if the descriptor sets dynamic_typing.
+   * Overrides from the node options replace the default values unless ignore_overrides is true.
+   *
+   * The callbacks registered with `add_on_set_parameters_callback` are called once with all
+   * parameters that have an initial value, like for set_parameters_atomically().
+   * If any of them rejects the change, nothing is declared.
+   * The callbacks registered with `add_post_set_parameters_callback` are then called once with
+   * the same parameters.
+   * Callbacks registered with `add_pre_set_parameters_callback` are not called.
+   *
+   * \param[in] namespace_ The namespace in which to declare the parameters.
+   * \param[in] parameters The parameters with their default value.
+   * \param[in] ignore_overrides When `true`, the parameter overrides are ignored.
+   * \return The values of the declared parameters, in the order of `parameters`.
+   * \throws rclcpp::exceptions::ParameterAlreadyDeclaredException if a parameter
+   *   has already been declared or appears twice.
+   * \throws rclcpp::exceptions::InvalidParametersException if a parameter name is invalid.
+   * \throws rclcpp::exceptions::InvalidParameterTypeException if a statically typed parameter
+   *   has no value or the initial value does not match its type.
+   * \throws rclcpp::exceptions::InvalidParameterValueException if an initial value is out of
+   *   range or rejected by a callback.
+   * In all cases no parameter is declared.
+   */
+  RCLCPP_PUBLIC
+  std::vector<rclcpp::ParameterValue>
+  declare_parameters_atomically(
+    const std::string & namespace_,
+    const std::vector<rclcpp::Parameter> & parameters,
+    bool ignore_overrides = false);
+
+  /// Declare and initialize several parameters with descriptors as one change.
+  /**
+   * \sa declare_parameters_atomically(const std::string &,
+   *   const std::vector<rclcpp::Parameter> &, bool)
+   */
+  RCLCPP_PUBLIC
+  std::vector<rclcpp::ParameterValue>
+  declare_parameters_atomically(
+    const std::string & namespace_,
+    const std::vector<std::pair<rclcpp::Parameter, rcl_interfaces::msg::ParameterDescriptor>> &
+    parameters,
+    bool ignore_overrides = false);
+
   /// Undeclare a previously declared parameter.
   /**
    * This method will _not_ cause a callback registered with any of the

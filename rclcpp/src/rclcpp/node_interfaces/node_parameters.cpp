@@ -494,6 +494,25 @@ __declare_parameter_common(
   return result;
 }
 
+[[noreturn]] static
+void
+throw_declare_parameter_failure(
+  const std::string & name,
+  const rcl_interfaces::msg::SetParametersResult & result)
+{
+  constexpr const char type_error_msg_start[] = "Wrong parameter type";
+  if (
+    0u == std::strncmp(
+      result.reason.c_str(), type_error_msg_start, sizeof(type_error_msg_start) - 1))
+  {
+    // TODO(ivanpauno): Refactor the logic so we don't need the above `strncmp` and we can
+    // detect between both exceptions more elegantly.
+    throw rclcpp::exceptions::InvalidParameterTypeException(name, result.reason);
+  }
+  throw rclcpp::exceptions::InvalidParameterValueException(
+          "parameter '" + name + "' could not be set: " + result.reason);
+}
+
 static
 const rclcpp::ParameterValue &
 declare_parameter_helper(
@@ -548,17 +567,7 @@ declare_parameter_helper(
 
   // If it failed to be set, then throw an exception.
   if (!result.successful) {
-    constexpr const char type_error_msg_start[] = "Wrong parameter type";
-    if (
-      0u == std::strncmp(
-        result.reason.c_str(), type_error_msg_start, sizeof(type_error_msg_start) - 1))
-    {
-      // TODO(ivanpauno): Refactor the logic so we don't need the above `strncmp` and we can
-      // detect between both exceptions more elegantly.
-      throw rclcpp::exceptions::InvalidParameterTypeException(name, result.reason);
-    }
-    throw rclcpp::exceptions::InvalidParameterValueException(
-            "parameter '" + name + "' could not be set: " + result.reason);
+    throw_declare_parameter_failure(name, result);
   }
 
   // Publish if events_publisher_ is not nullptr, which may be if disabled in the constructor.
@@ -630,6 +639,92 @@ NodeParameters::declare_parameter(
     events_publisher_.get(),
     combined_name_,
     *node_clock_);
+}
+
+std::vector<rclcpp::ParameterValue>
+NodeParameters::declare_parameters_atomically(
+  const std::string & namespace_,
+  const std::vector<std::pair<rclcpp::Parameter, rcl_interfaces::msg::ParameterDescriptor>> &
+  parameters,
+  bool ignore_overrides)
+{
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  ParameterMutationRecursionGuard guard(parameter_modification_enabled_);
+
+  const std::string prefix = namespace_.empty() ? "" : namespace_ + ".";
+  std::vector<std::string> names;
+  names.reserve(parameters.size());
+  std::map<std::string, ParameterInfo> declared;
+  std::vector<rclcpp::Parameter> initial_values;
+  for (const auto & [parameter, parameter_descriptor] : parameters) {
+    if (parameter.get_name().empty()) {
+      throw rclcpp::exceptions::InvalidParametersException("parameter name must not be empty");
+    }
+    const std::string name = prefix + parameter.get_name();
+    if (__lockless_has_parameter(parameters_, name) || declared.count(name) != 0) {
+      throw rclcpp::exceptions::ParameterAlreadyDeclaredException(
+              "parameter '" + name + "' has already been declared");
+    }
+
+    ParameterInfo & info = declared[name];
+    info.descriptor = parameter_descriptor;
+    info.descriptor.name = name;
+    if (!parameter_descriptor.dynamic_typing) {
+      if (rclcpp::PARAMETER_NOT_SET == parameter.get_type()) {
+        throw rclcpp::exceptions::InvalidParameterTypeException{
+                name,
+                "cannot declare a statically typed parameter with an uninitialized value"
+        };
+      }
+      info.descriptor.type = static_cast<uint8_t>(parameter.get_type());
+    }
+
+    const rclcpp::ParameterValue * initial_value = &parameter.get_parameter_value();
+    auto overrides_it = parameter_overrides_.find(name);
+    if (!ignore_overrides && overrides_it != parameter_overrides_.end()) {
+      initial_value = &overrides_it->second;
+    }
+    if (initial_value->get_type() == rclcpp::PARAMETER_NOT_SET) {
+      info.descriptor.type = rclcpp::PARAMETER_NOT_SET;
+    } else {
+      initial_values.emplace_back(name, *initial_value);
+      // Checked one by one to name the parameter in the exception.
+      auto result = __check_parameters(declared, {initial_values.back()}, false);
+      if (!result.successful) {
+        throw_declare_parameter_failure(name, result);
+      }
+    }
+    names.push_back(name);
+  }
+
+  auto result = __set_parameters_atomically_common(
+    initial_values,
+    declared,
+    on_set_parameters_callback_container_,
+    post_set_parameters_callback_container_);
+  if (!result.successful) {
+    throw rclcpp::exceptions::InvalidParameterValueException(
+            "parameters could not be declared: " + result.reason);
+  }
+  parameters_.insert(declared.begin(), declared.end());
+
+  if (nullptr != events_publisher_ && !names.empty()) {
+    rcl_interfaces::msg::ParameterEvent parameter_event;
+    parameter_event.node = combined_name_;
+    parameter_event.stamp = node_clock_->get_clock()->now();
+    parameter_event.new_parameters.reserve(initial_values.size());
+    for (const auto & parameter : initial_values) {
+      parameter_event.new_parameters.push_back(parameter.to_parameter_msg());
+    }
+    events_publisher_->publish(parameter_event);
+  }
+
+  std::vector<rclcpp::ParameterValue> values;
+  values.reserve(names.size());
+  for (const auto & name : names) {
+    values.push_back(parameters_.at(name).value);
+  }
+  return values;
 }
 
 void

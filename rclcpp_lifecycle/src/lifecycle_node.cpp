@@ -233,6 +233,31 @@ LifecycleNode::declare_parameter(
     ignore_override);
 }
 
+std::vector<rclcpp::ParameterValue>
+LifecycleNode::declare_parameters_atomically(
+  const std::string & namespace_,
+  const std::vector<rclcpp::Parameter> & parameters,
+  bool ignore_overrides)
+{
+  std::vector<std::pair<rclcpp::Parameter, rcl_interfaces::msg::ParameterDescriptor>> pairs;
+  pairs.reserve(parameters.size());
+  for (const auto & parameter : parameters) {
+    pairs.emplace_back(parameter, rcl_interfaces::msg::ParameterDescriptor{});
+  }
+  return this->declare_parameters_atomically(namespace_, pairs, ignore_overrides);
+}
+
+std::vector<rclcpp::ParameterValue>
+LifecycleNode::declare_parameters_atomically(
+  const std::string & namespace_,
+  const std::vector<std::pair<rclcpp::Parameter, rcl_interfaces::msg::ParameterDescriptor>> &
+  parameters,
+  bool ignore_overrides)
+{
+  return std::static_pointer_cast<rclcpp::node_interfaces::NodeParameters>(node_parameters_)
+         ->declare_parameters_atomically(namespace_, parameters, ignore_overrides);
+}
+
 void
 LifecycleNode::undeclare_parameter(const std::string & name)
 {

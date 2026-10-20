@@ -1001,3 +1001,29 @@ TEST_F(TestDefaultStateMachine, shared_time_source) {
   lifecycle_source.reset();
   EXPECT_TRUE(node->get_clock()->ros_time_is_active());
 }
+
+TEST_F(TestDefaultStateMachine, declare_parameters_atomically) {
+  auto test_node = std::make_shared<EmptyLifecycleNode>("testnode");
+  size_t on_set_calls = 0;
+  auto handle = test_node->add_on_set_parameters_callback(
+    [&on_set_calls](const std::vector<rclcpp::Parameter> &) {
+      ++on_set_calls;
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      return result;
+    });
+  auto values = test_node->declare_parameters_atomically(
+    "ns", {rclcpp::Parameter("a", 1), rclcpp::Parameter("b", "two")});
+  ASSERT_EQ(values.size(), 2u);
+  EXPECT_EQ(values[0].get<int64_t>(), 1);
+  EXPECT_EQ(test_node->get_parameter("ns.b").as_string(), "two");
+  EXPECT_EQ(on_set_calls, 1u);
+
+  rcl_interfaces::msg::ParameterDescriptor read_only;
+  read_only.read_only = true;
+  EXPECT_THROW(
+    test_node->declare_parameters_atomically(
+      "", {{rclcpp::Parameter("c", 1), read_only}, {rclcpp::Parameter("ns.a", 2), read_only}}),
+    rclcpp::exceptions::ParameterAlreadyDeclaredException);
+  EXPECT_FALSE(test_node->has_parameter("c"));
+}

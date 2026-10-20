@@ -447,6 +447,13 @@ if(TARGET test_time_source)
   target_link_libraries(test_time_source ${PROJECT_NAME} rcl::rcl)
 endif()
 
+ament_add_gtest(test_declare_parameters_atomically test_declare_parameters_atomically.cpp
+  APPEND_LIBRARY_DIRS "${append_library_dirs}" TIMEOUT 120)
+if(TARGET test_declare_parameters_atomically)
+  target_link_libraries(test_declare_parameters_atomically ${PROJECT_NAME}
+    ${rcl_interfaces_TARGETS})
+endif()
+
 ament_add_gtest(test_shared_time_source test_shared_time_source.cpp
   APPEND_LIBRARY_DIRS "${append_library_dirs}" TIMEOUT 120)
 if(TARGET test_shared_time_source)
