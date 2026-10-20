@@ -26,6 +26,8 @@
 #include <string>
 #include <utility>
 
+#include "rcl/intra_process.h"
+
 #include "rcl/error_handling.h"
 #include "rcl/subscription.h"
 
@@ -152,7 +154,11 @@ public:
   // *INDENT-ON*
   {
     // Setup intra process publishing if requested.
-    if (rclcpp::detail::resolve_use_intra_process(options_, *node_base)) {
+    const bool legacy_ipc = rclcpp::detail::resolve_use_intra_process(options_, *node_base);
+    if (legacy_ipc || options_.use_intra_process_comm == rclcpp::IntraProcessSetting::Disable) {
+      rcl_subscription_disable_ipc(this->subscription_handle_.get());
+    }
+    if (legacy_ipc) {
       using rclcpp::detail::resolve_intra_process_buffer_type;
 
       // Check if the QoS is compatible with intra-process.
@@ -312,6 +318,11 @@ public:
       now = std::chrono::system_clock::now();
     }
 
+    if (message_info.get_rmw_message_info().from_intra_process &&
+      !any_callback_.use_take_shared_method())
+    {
+      typed_message = std::make_shared<ROSMessageType>(*typed_message);
+    }
     any_callback_.dispatch(typed_message, message_info);
 
     if (subscription_topic_statistics_) {

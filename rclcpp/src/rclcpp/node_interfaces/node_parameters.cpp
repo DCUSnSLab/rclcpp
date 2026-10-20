@@ -1191,3 +1191,8 @@ NodeParameters::get_parameter_overrides() const
 {
   return parameter_overrides_;
 }
+
+// Preserve the Jazzy library's existing template destructor exports.
+template std::unique_ptr<
+  rclcpp::experimental::buffers::RingBufferImplementation<
+    std::unique_ptr<rcl_interfaces::msg::ParameterEvent>>>::~unique_ptr();

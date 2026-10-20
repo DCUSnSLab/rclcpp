@@ -23,6 +23,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "rcl/intra_process.h"
+
 #include "rcl/error_handling.h"
 #include "rcl/publisher.h"
 #include "rmw/error_handling.h"
@@ -166,7 +168,11 @@ public:
     (void)options;
 
     // If needed, setup intra process communication.
-    if (rclcpp::detail::resolve_use_intra_process(options_, *node_base)) {
+    const bool legacy_ipc = rclcpp::detail::resolve_use_intra_process(options_, *node_base);
+    if (legacy_ipc || options_.use_intra_process_comm == rclcpp::IntraProcessSetting::Disable) {
+      rcl_publisher_disable_ipc(this->publisher_handle_.get());
+    }
+    if (legacy_ipc) {
       auto context = node_base->get_context();
       // Get the intra process manager instance for this context.
       auto ipm = context->get_sub_context<rclcpp::experimental::IntraProcessManager>();
@@ -241,6 +247,16 @@ public:
   >
   publish(std::unique_ptr<T, ROSMessageTypeDeleter> msg)
   {
+    if constexpr (std::is_same<ROSMessageTypeDeleter, std::default_delete<T>>::value) {
+      if (rcl_publisher_is_ipc_enabled(this->publisher_handle_.get())) {
+        using Owner = decltype(msg);
+        auto owner = new Owner(std::move(msg));
+        auto ret = rcl_publish_ipc_owned(this->publisher_handle_.get(), owner->get(),
+            [](void * value) {delete static_cast<Owner *>(value);}, owner);
+        if (ret != RCL_RET_OK) {rclcpp::exceptions::throw_from_rcl_error(ret);}
+        return;
+      }
+    }
     if (!intra_process_is_enabled_) {
       this->do_inter_process_publish(*msg);
       return;

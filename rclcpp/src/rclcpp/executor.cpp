@@ -23,6 +23,8 @@
 #include <utility>
 #include <vector>
 
+#include "rcl/intra_process.h"
+
 #include "rcl/allocator.h"
 #include "rcl/error_handling.h"
 #include "rclcpp/executors/executor_notify_waitable.hpp"
@@ -611,6 +613,17 @@ Executor::execute_subscription(rclcpp::SubscriptionBase::SharedPtr subscription)
         } else {
           // This case is taking a copy of the message data from the middleware via
           // inter-process communication.
+          rcl_ipc_message_t * owned = nullptr;
+          const void * data = nullptr;
+          if (rcl_take_ipc_message(subscription->get_subscription_handle().get(), &owned,
+            &data, &message_info.get_rmw_message_info()) == RCL_RET_OK)
+          {
+            std::shared_ptr<void> message(const_cast<void *>(data), [owned](void *) {
+                rcl_ipc_message_release(owned);
+              });
+            subscription->handle_message(message, message_info);
+            break;
+          }
           std::shared_ptr<void> message = subscription->create_message();
           take_and_do_error_handling(
             "taking a message from topic",

@@ -20,6 +20,8 @@
 #include <memory>
 #include <string>
 
+#include "rcl/intra_process.h"
+
 #include "rcpputils/shared_library.hpp"
 
 #include "rclcpp/callback_group.hpp"
@@ -87,6 +89,7 @@ public:
     any_callback_(callback),
     ts_lib_(ts_lib)
   {
+    rcl_subscription_disable_ipc(this->get_subscription_handle().get());
     TRACETOOLS_TRACEPOINT(
       rclcpp_subscription_init,
       static_cast<const void *>(get_subscription_handle().get()),
