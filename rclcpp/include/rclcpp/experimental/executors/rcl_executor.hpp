@@ -10,6 +10,7 @@
 #define RCLCPP__EXPERIMENTAL__EXECUTORS__RCL_EXECUTOR_HPP_
 
 #include <rcl_executor/executor.h>
+#include <functional>
 #include <memory>
 #include <rclcpp/executor.hpp>
 
@@ -26,11 +27,25 @@ public:
   RCLCPP_PUBLIC
   explicit RclExecutor(
     const ExecutorOptions & options = ExecutorOptions(), size_t number_of_threads = 1);
-  // Composite waitables retain entity-ID takes: notifications lack their wait-set snapshot.
   RCLCPP_PUBLIC
   RclExecutor(
     const ExecutorOptions & options, size_t number_of_threads,
     rcl_executor_selection_policy_t selection_policy);
+  enum class Mode {Shared, Partitioned};
+  RCLCPP_PUBLIC
+  RclExecutor(
+    const ExecutorOptions & options, Mode mode,
+    rcl_executor_selection_policy_t selection_policy = RCL_EXECUTOR_WAIT_SET);
+  using ThreadStart = std::function<void(size_t, CallbackGroup::SharedPtr)>;
+  RCLCPP_PUBLIC
+  void on_thread_start(ThreadStart callback);
+  // Notify by registration ID; remove before releasing the callback's captured resources.
+  RCLCPP_PUBLIC
+  rcl_executor_id_t add_source(CallbackGroup::SharedPtr group, std::function<void()> dispatch);
+  RCLCPP_PUBLIC
+  void notify_source(rcl_executor_id_t source, size_t count = 1);
+  RCLCPP_PUBLIC
+  void remove_source(rcl_executor_id_t source);
   RCLCPP_PUBLIC
   void set_group_priority(CallbackGroup::SharedPtr group, int32_t priority);
   RCLCPP_PUBLIC

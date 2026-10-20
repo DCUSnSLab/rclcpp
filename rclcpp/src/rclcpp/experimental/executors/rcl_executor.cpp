@@ -7,6 +7,7 @@
 // specific language governing permissions and limitations under the License.
 
 #include "rclcpp/experimental/executors/rcl_executor.hpp"
+#include <rcl/wait.h>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -57,14 +58,23 @@ struct RclExecutor::Impl
   std::mutex selection_mutex;
   std::unordered_map<const void *, std::shared_ptr<Entity>> entities;
   std::exception_ptr error;
+  bool partitioned = false;
+  ThreadStart thread_start;
+  std::unordered_map<uint64_t, CallbackGroup::WeakPtr> known_groups;
+  std::unordered_map<uint64_t, std::shared_ptr<Entity>> sources;
 
-  Impl(RclExecutor & executor, size_t count, rcl_executor_selection_policy_t selection)
-  : owner(executor), threads(std::max<size_t>(count, 1)), policy(selection)
+  Impl(
+    RclExecutor & executor, size_t count, rcl_executor_selection_policy_t selection,
+    bool partitions = false)
+  : owner(executor), threads(std::max<size_t>(count, 1)), policy(selection), partitioned(partitions)
   {
     checked(rcl_executor_create_with_policy(&core, policy));
+    checked(rcl_executor_set_partitioned(core, partitioned));
     handle = rcl_executor_get_handle(core);
-    checked(rcl_executor_add_group(core, UINT64_MAX, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
-    checked(rcl_executor_add(core, RCL_EXECUTOR_WORK, nullptr, nullptr, UINT64_MAX, &maintenance));
+    checked(rcl_executor_add_group(core, partitioned ? 0 : UINT64_MAX,
+        partitioned ? RCL_EXECUTOR_REENTRANT : RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+    checked(rcl_executor_add(core, RCL_EXECUTOR_WORK, nullptr, nullptr,
+        partitioned ? 0 : UINT64_MAX, &maintenance));
     if (policy == RCL_EXECUTOR_WAIT_SET) {
       checked(rcl_executor_set_order(core, maintenance, UINT64_MAX));
     }
@@ -89,11 +99,14 @@ struct RclExecutor::Impl
   {
     std::lock_guard<std::mutex> lock(mutex);
     std::unordered_set<const void *> seen;
+    std::unordered_set<uint64_t> seen_groups;
     auto groups = owner.get_all_callback_groups();
     for (auto & weak : groups) {
       auto group = weak.lock();
       if (!group) {continue;}
       auto group_id = reinterpret_cast<uintptr_t>(group.get());
+      seen_groups.insert(group_id);
+      known_groups[group_id] = group;
       checked(rcl_executor_add_group(core, group_id,
           group->type() == CallbackGroupType::Reentrant ?
           RCL_EXECUTOR_REENTRANT : RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
@@ -124,20 +137,41 @@ struct RclExecutor::Impl
             waitable->get_number_of_ready_events() == 0;
           std::weak_ptr<Entity> weak_entity = entity;
           Waitable::WeakPtr weak_waitable = waitable;
-          checked(rcl_executor_add(core, RCL_EXECUTOR_WORK, nullptr, waitable.get(),
+          checked(rcl_executor_add(core, policy == RCL_EXECUTOR_WAIT_SET ?
+              RCL_EXECUTOR_WAITABLE : RCL_EXECUTOR_WORK, nullptr, waitable.get(),
               group_id, &entity->id));
-          entity->execute = [weak_entity, weak_waitable](const rcl_executor_item_t &) {
+          entity->execute = [this, weak_entity, weak_waitable](const rcl_executor_item_t &) {
               auto e = weak_entity.lock();
               auto work = weak_waitable.lock();
               if (!e || !work) {return false;}
-              int id;
-              {
+              int id = 0;
+              if (policy != RCL_EXECUTOR_WAIT_SET) {
                 std::lock_guard<std::mutex> guard(e->mutex);
                 id = e->events.front();
                 e->events.pop_front();
               }
-              const auto data = work->take_data_by_entity_id(static_cast<size_t>(id));
-              work->execute(data);
+              std::shared_ptr<void> data;
+              if (policy == RCL_EXECUTOR_WAIT_SET) {
+                auto ws = rcl_get_zero_initialized_wait_set();
+                checked(rcl_wait_set_init(&ws,
+                    work->get_number_of_ready_subscriptions(),
+                    work->get_number_of_ready_guard_conditions(),
+                    work->get_number_of_ready_timers(), work->get_number_of_ready_clients(),
+                    work->get_number_of_ready_services(), work->get_number_of_ready_events(),
+                    owner.context_->get_rcl_context().get(), rcl_get_default_allocator()));
+                RCPPUTILS_SCOPE_EXIT(checked(rcl_wait_set_fini(&ws)););
+                work->add_to_wait_set(ws);
+                auto result = rcl_wait(&ws, 0);
+                if (result != RCL_RET_TIMEOUT) {checked(result);}
+                if (!work->is_ready(ws)) {return false;}
+                RCPPUTILS_SCOPE_EXIT(checked(rcl_executor_notify(core, e->id, 1)););
+                const auto ready_data = work->take_data();
+                work->execute(ready_data);
+                return true;
+              } else {
+                data = work->take_data_by_entity_id(static_cast<size_t>(id));
+              }
+              work->execute(static_cast<const std::shared_ptr<void> &>(data));
               return true;
             };
           entity->clear = [weak_waitable] {
@@ -147,6 +181,10 @@ struct RclExecutor::Impl
           waitable->set_on_ready_callback([this, weak_entity](size_t count, int id) {
               auto e = weak_entity.lock();
               if (!e) {return;}
+              if (policy == RCL_EXECUTOR_WAIT_SET) {
+                checked(rcl_executor_notify(core, e->id, 1));
+                return;
+              }
               size_t credits = count;
               {
                 std::lock_guard<std::mutex> guard(e->mutex);
@@ -160,6 +198,9 @@ struct RclExecutor::Impl
               }
               checked(rcl_executor_notify(core, e->id, credits));
             });
+          if (policy == RCL_EXECUTOR_WAIT_SET) {
+            checked(rcl_executor_notify(core, entity->id, 1));
+          }
         };
       group->collect_all_ptrs(
         [&](const SubscriptionBase::SharedPtr & sub) {
@@ -211,6 +252,11 @@ struct RclExecutor::Impl
       checked(rcl_executor_remove(core, it->second->id));
       it = entities.erase(it);
     }
+    for (auto it = known_groups.begin(); it != known_groups.end(); ) {
+      if (seen_groups.count(it->first)) {++it; continue;}
+      checked(rcl_executor_remove_group(core, it->first));
+      it = known_groups.erase(it);
+    }
     if (policy == RCL_EXECUTOR_WAIT_SET) {
       std::lock_guard<std::mutex> owner_lock(owner.mutex_);
       if (owner.entities_need_rebuild_.exchange(false) || owner.current_collection_.empty()) {
@@ -242,8 +288,13 @@ struct RclExecutor::Impl
     {
       std::lock_guard<std::mutex> lock(mutex);
       auto found = entities.find(item.context);
-      if (found == entities.end() || found->second->id != item.registration) {return false;}
-      entity = found->second;
+      if (found != entities.end() && found->second->id == item.registration) {
+        entity = found->second;
+      } else {
+        auto source = sources.find(item.registration);
+        if (source == sources.end()) {return false;}
+        entity = source->second;
+      }
     }
     auto group = entity->group.lock();
     if (!group) {return false;}
@@ -260,8 +311,9 @@ struct RclExecutor::Impl
 
   void spin_wait_set()
   {
-    auto run = [this] {
+    auto run = [this](size_t index) {
         try {
+          start_thread(index, 0, this);
           while (owner.spinning && rclcpp::ok(owner.context_)) {
             rcl_executor_item_t item;
             {
@@ -301,14 +353,32 @@ struct RclExecutor::Impl
       };
     std::vector<std::thread> workers;
     try {
-      for (size_t i = 1; i < threads; ++i) {workers.emplace_back(run);}
+      for (size_t i = 1; i < threads; ++i) {workers.emplace_back(run, i);}
     } catch (...) {
       rcl_executor_stop(handle);
       for (auto & worker : workers) {worker.join();}
       throw;
     }
-    run();
+    run(0);
     for (auto & worker : workers) {worker.join();}
+  }
+
+  static void start_thread(size_t index, uint64_t id, void * data) noexcept
+  {
+    auto self = static_cast<Impl *>(data);
+    try {
+      CallbackGroup::SharedPtr group;
+      {
+        std::lock_guard<std::mutex> lock(self->mutex);
+        auto found = self->known_groups.find(id);
+        if (found != self->known_groups.end()) {group = found->second.lock();}
+      }
+      if (self->thread_start) {self->thread_start(index, group);}
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(self->mutex);
+      if (!self->error) {self->error = std::current_exception();}
+      rcl_executor_stop(self->handle);
+    }
   }
 
   static void dispatch(const rcl_executor_item_t * item, void * data) noexcept
@@ -329,6 +399,40 @@ RclExecutor::RclExecutor(const ExecutorOptions & options, size_t threads)
 RclExecutor::RclExecutor(
   const ExecutorOptions & options, size_t threads, rcl_executor_selection_policy_t selection_policy)
 : Executor(options), impl_(std::make_unique<Impl>(*this, threads, selection_policy)) {}
+RclExecutor::RclExecutor(
+  const ExecutorOptions & options, Mode mode, rcl_executor_selection_policy_t policy)
+: Executor(options), impl_(std::make_unique<Impl>(*this, 1, policy, mode == Mode::Partitioned)) {}
+void RclExecutor::on_thread_start(ThreadStart callback)
+{
+  if (spinning) {throw std::logic_error("executor is spinning");}
+  impl_->thread_start = std::move(callback);
+  checked(rcl_executor_set_thread_start(impl_->core, Impl::start_thread, impl_.get()));
+}
+rcl_executor_id_t RclExecutor::add_source(
+  CallbackGroup::SharedPtr group, std::function<void()> dispatch)
+{
+  impl_->sync();
+  auto entity = std::make_shared<Impl::Entity>();
+  entity->group = group;
+  entity->execute = [dispatch = std::move(dispatch)](const rcl_executor_item_t &) {
+      dispatch(); return true;
+    };
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  checked(rcl_executor_add(impl_->core, RCL_EXECUTOR_WORK, nullptr, entity.get(),
+      reinterpret_cast<uintptr_t>(group.get()), &entity->id));
+  impl_->sources.emplace(entity->id, entity);
+  return entity->id;
+}
+void RclExecutor::notify_source(rcl_executor_id_t source, size_t count)
+{
+  checked(rcl_executor_notify(impl_->core, source, count));
+}
+void RclExecutor::remove_source(rcl_executor_id_t source)
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  checked(rcl_executor_remove(impl_->core, source));
+  impl_->sources.erase(source);
+}
 void RclExecutor::set_group_priority(CallbackGroup::SharedPtr group, int32_t priority)
 {
   impl_->sync();
@@ -338,6 +442,15 @@ void RclExecutor::set_group_priority(CallbackGroup::SharedPtr group, int32_t pri
 RclExecutor::~RclExecutor() = default;
 void RclExecutor::add_node(node_interfaces::NodeBaseInterface::SharedPtr node, bool notify)
 {
+  if (impl_->partitioned) {
+    node->for_each_callback_group([](const CallbackGroup::SharedPtr & group) {
+        if (group->automatically_add_to_executor_with_node() &&
+        group->type() == CallbackGroupType::Reentrant)
+        {
+          throw std::invalid_argument("partition mode refuses Reentrant callback groups");
+        }
+      });
+  }
   Executor::add_node(node, notify);
   impl_->sync();
 }
@@ -349,6 +462,9 @@ void RclExecutor::remove_node(node_interfaces::NodeBaseInterface::SharedPtr node
 void RclExecutor::add_callback_group(
   CallbackGroup::SharedPtr group, node_interfaces::NodeBaseInterface::SharedPtr node, bool notify)
 {
+  if (impl_->partitioned && group->type() == CallbackGroupType::Reentrant) {
+    throw std::invalid_argument("partition mode refuses Reentrant callback groups");
+  }
   Executor::add_callback_group(group, node, notify);
   impl_->sync();
 }
@@ -370,7 +486,7 @@ void RclExecutor::spin()
   impl_->sync();
   impl_->error = nullptr;
   auto result = RCL_RET_OK;
-  if (impl_->policy == RCL_EXECUTOR_WAIT_SET) {
+  if (impl_->policy == RCL_EXECUTOR_WAIT_SET && !impl_->partitioned) {
     impl_->spin_wait_set();
   } else {
     result = rcl_executor_spin(impl_->core, impl_->threads, Impl::dispatch, impl_.get());
@@ -380,6 +496,7 @@ void RclExecutor::spin()
 }
 void RclExecutor::spin_once_impl(std::chrono::nanoseconds timeout)
 {
+  if (impl_->partitioned) {throw std::logic_error("partition mode requires spin()");}
   RCPPUTILS_SCOPE_EXIT(rcl_executor_reset(impl_->core););
   impl_->sync();
   auto start = std::chrono::steady_clock::now();
@@ -404,6 +521,7 @@ void RclExecutor::spin_once_impl(std::chrono::nanoseconds timeout)
 }
 void RclExecutor::drain(std::chrono::nanoseconds duration, bool exhaustive)
 {
+  if (impl_->partitioned) {throw std::logic_error("partition mode requires spin()");}
   if (spinning.exchange(true)) {throw std::runtime_error("executor is already spinning");}
   RCPPUTILS_SCOPE_EXIT(spinning = false; rcl_executor_reset(impl_->core););
   impl_->sync();

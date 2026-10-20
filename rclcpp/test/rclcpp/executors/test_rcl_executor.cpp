@@ -6,9 +6,15 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+#include <unistd.h>
 #include <gtest/gtest.h>
 #include <chrono>
 #include <future>
+#include <array>
+#include <atomic>
+#include <iostream>
+#include <map>
+#include <mutex>
 #include <thread>
 #include <cstdlib>
 #include <string>
@@ -319,6 +325,213 @@ TEST(RclExecutorPolicy, priority_drains_high_group_before_low_group)
       executor.spin_once(100ms);
     }
     EXPECT_EQ((std::vector<std::string>{"high", "high", "low", "low"}), sequence);
+    executor.remove_node(node);
+  }
+  rclcpp::shutdown();
+}
+
+TEST(RclExecutorHooks, partition_threads_are_stable_and_slow_groups_are_isolated)
+{
+  rclcpp::init(0, nullptr);
+  {
+    auto node = std::make_shared<rclcpp::Node>("partition_threads");
+    auto slow = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+    auto fast = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+    RclExecutor executor(rclcpp::ExecutorOptions(), RclExecutor::Mode::Partitioned);
+    executor.add_callback_group(slow, node->get_node_base_interface());
+    executor.add_callback_group(fast, node->get_node_base_interface());
+    std::mutex mutex;
+    std::map<const void *, std::thread::id> started;
+    std::map<const void *, int> starts;
+    executor.on_thread_start([&](size_t, auto group) {
+        std::lock_guard<std::mutex> lock(mutex);
+        started[group.get()] = std::this_thread::get_id();
+        ++starts[group.get()];
+      });
+    std::promise<void> entered, finished, fast_done;
+    auto entered_future = entered.get_future();
+    auto finished_future = finished.get_future();
+    auto fast_future = fast_done.get_future();
+    std::atomic<int> fast_calls{0};
+    rclcpp::TimerBase::SharedPtr slow_timer;
+    slow_timer = node->create_wall_timer(1ms, [&] {
+          slow_timer->cancel();
+          {
+            std::lock_guard<std::mutex> lock(mutex);
+            EXPECT_EQ(started.at(slow.get()), std::this_thread::get_id());
+          }
+          entered.set_value();
+          std::this_thread::sleep_for(200ms);
+          finished.set_value();
+      }, slow);
+    auto fast_timer = node->create_wall_timer(2ms, [&] {
+          std::lock_guard<std::mutex> lock(mutex);
+          EXPECT_EQ(started.at(fast.get()), std::this_thread::get_id());
+          if (++fast_calls == 10) {fast_done.set_value();}
+      }, fast);
+    std::thread spin([&] {executor.spin();});
+    EXPECT_EQ(std::future_status::ready, entered_future.wait_for(2s));
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(std::future_status::ready, fast_future.wait_for(100ms));
+    auto latency = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(latency, 100ms);
+    EXPECT_EQ(std::future_status::timeout, finished_future.wait_for(0ms));
+    slow_timer->cancel();
+    fast_timer->cancel();
+    executor.remove_callback_group(fast);
+    auto late = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+    std::promise<void> late_done;
+    auto late_future = late_done.get_future();
+    executor.add_callback_group(late, node->get_node_base_interface());
+    auto late_source = executor.add_source(late, [&] {
+          {
+            std::lock_guard<std::mutex> lock(mutex);
+            EXPECT_EQ(started.at(late.get()), std::this_thread::get_id());
+          }
+          late_done.set_value();
+      });
+    auto removed_source = executor.add_source(slow, [] {FAIL() << "removed source executed";});
+    executor.notify_source(removed_source);
+    executor.remove_source(removed_source);
+    executor.notify_source(late_source);
+    EXPECT_EQ(std::future_status::ready, late_future.wait_for(1s));
+    executor.remove_source(late_source);
+    executor.remove_callback_group(late);
+    EXPECT_EQ(std::future_status::ready, finished_future.wait_for(1s));
+    executor.cancel();
+    spin.join();
+    EXPECT_NE(started.at(slow.get()), started.at(fast.get()));
+    EXPECT_EQ(1, starts.at(slow.get()));
+    EXPECT_EQ(1, starts.at(fast.get()));
+    EXPECT_EQ(1, starts.at(late.get()));
+    std::cout << "fast group: " << fast_calls << " callbacks; latency after slow entry: " <<
+      std::chrono::duration<double, std::milli>(latency).count() << " ms; slow callback: 200 ms\n";
+    auto reentrant = node->create_callback_group(rclcpp::CallbackGroupType::Reentrant, false);
+    EXPECT_THROW(executor.add_callback_group(reentrant, node->get_node_base_interface()),
+      std::invalid_argument);
+  }
+  rclcpp::shutdown();
+}
+
+TEST(RclExecutorHooks, pipe_source_orders_with_ros_and_removes_pending_work)
+{
+  rclcpp::init(0, nullptr);
+  for (auto policy : {RCL_EXECUTOR_FIFO, RCL_EXECUTOR_WAIT_SET}) {
+    auto node = std::make_shared<rclcpp::Node>("external_pipe");
+    auto group = node->get_node_base_interface()->get_default_callback_group();
+    RclExecutor executor(rclcpp::ExecutorOptions(), 1, policy);
+    std::vector<std::string> sequence;
+    auto sub = node->create_subscription<Message>("external_order", 10,
+        [&](Message::ConstSharedPtr) {sequence.push_back("ros");});
+    auto pub = node->create_publisher<Message>("external_order", 10);
+    executor.add_node(node);
+    auto source = executor.add_source(group, [&] {sequence.push_back("external");});
+    int descriptors[2];
+    ASSERT_EQ(0, pipe(descriptors));
+    std::thread driver([&] {
+        char byte;
+        EXPECT_EQ(1, read(descriptors[0], &byte, 1));
+        executor.notify_source(source);
+      });
+    EXPECT_EQ(1, write(descriptors[1], "x", 1));
+    driver.join();
+    pub->publish(Message());
+    std::this_thread::sleep_for(20ms);
+    executor.spin_some();
+    EXPECT_EQ((policy == RCL_EXECUTOR_FIFO ?
+      std::vector<std::string>{"external", "ros"} :
+      std::vector<std::string>{"ros", "external"}), sequence);
+    executor.notify_source(source);
+    executor.remove_source(source);
+    executor.notify_source(source);
+    executor.spin_some();
+    EXPECT_EQ(2u, sequence.size());
+    close(descriptors[0]);
+    close(descriptors[1]);
+  }
+  rclcpp::shutdown();
+}
+
+namespace
+{
+class TwoGuards : public rclcpp::Waitable
+{
+public:
+  std::array<rclcpp::GuardCondition, 2> guards;
+  std::array<bool, 2> pending{};
+  size_t selected = 0;
+  rclcpp::Executor * executor = nullptr;
+  std::vector<size_t> sequence;
+  size_t get_number_of_ready_guard_conditions() override {return 2;}
+  void add_to_wait_set(rcl_wait_set_t & waitset) override
+  {
+    for (size_t i = 0; i < 2; ++i) {
+      if (pending[i]) {guards[i].trigger();}
+      auto result = rcl_wait_set_add_guard_condition(&waitset, &guards[i].get_rcl_guard_condition(),
+          nullptr);
+      if (result != RCL_RET_OK) {throw std::runtime_error("add guard");}
+    }
+  }
+  bool is_ready(const rcl_wait_set_t & waitset) override
+  {
+    for (size_t i = 0; i < 2; ++i) {
+      for (size_t j = 0; j < waitset.size_of_guard_conditions; ++j) {
+        if (pending[i] && waitset.guard_conditions[j] == &guards[i].get_rcl_guard_condition()) {
+          selected = i;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  std::shared_ptr<void> take_data() override {return std::make_shared<size_t>(selected);}
+  std::shared_ptr<void> take_data_by_entity_id(size_t id) override
+  {
+    return std::make_shared<size_t>(id);
+  }
+  void execute(const std::shared_ptr<void> & data) override
+  {
+    auto id = *std::static_pointer_cast<size_t>(data);
+    pending[id] = false;
+    sequence.push_back(id);
+    if (sequence.size() == 2) {executor->cancel();}
+  }
+  void set_on_ready_callback(std::function<void(size_t, int)> callback) override
+  {
+    for (int i = 0; i < 2; ++i) {
+      guards[i].set_on_trigger_callback([callback, i](size_t count) {callback(count, i);});
+    }
+  }
+  void clear_on_ready_callback() override
+  {
+    for (auto & guard : guards) {guard.set_on_trigger_callback(nullptr);}
+  }
+};
+}  // namespace
+
+TEST(RclExecutorHooks, composite_waitable_chooses_the_ready_entity)
+{
+  rclcpp::init(0, nullptr);
+  {
+    auto node = std::make_shared<rclcpp::Node>("composite_waitable_order");
+    auto work = std::make_shared<TwoGuards>();
+    auto group = node->get_node_base_interface()->get_default_callback_group();
+    node->get_node_waitables_interface()->add_waitable(work, group);
+    RclExecutor executor(rclcpp::ExecutorOptions(), 1, RCL_EXECUTOR_WAIT_SET);
+    work->executor = &executor;
+    executor.add_node(node);
+    for (int i : {1, 0}) {
+      work->pending[i] = true; work->guards[i].trigger();
+    }
+    std::promise<void> done;
+    auto future = done.get_future();
+    std::thread watchdog([&] {
+        if (future.wait_for(2s) == std::future_status::timeout) {executor.cancel();}
+      });
+    executor.spin();
+    done.set_value();
+    watchdog.join();
+    EXPECT_EQ((std::vector<size_t>{0, 1}), work->sequence);
     executor.remove_node(node);
   }
   rclcpp::shutdown();
