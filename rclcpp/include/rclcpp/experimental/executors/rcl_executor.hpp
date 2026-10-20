@@ -9,6 +9,7 @@
 #ifndef RCLCPP__EXPERIMENTAL__EXECUTORS__RCL_EXECUTOR_HPP_
 #define RCLCPP__EXPERIMENTAL__EXECUTORS__RCL_EXECUTOR_HPP_
 
+#include <rcl_executor/executor.h>
 #include <memory>
 #include <rclcpp/executor.hpp>
 
@@ -25,6 +26,13 @@ public:
   RCLCPP_PUBLIC
   explicit RclExecutor(
     const ExecutorOptions & options = ExecutorOptions(), size_t number_of_threads = 1);
+  // Composite waitables retain entity-ID takes: notifications lack their wait-set snapshot.
+  RCLCPP_PUBLIC
+  RclExecutor(
+    const ExecutorOptions & options, size_t number_of_threads,
+    rcl_executor_selection_policy_t selection_policy);
+  RCLCPP_PUBLIC
+  void set_group_priority(CallbackGroup::SharedPtr group, int32_t priority);
   RCLCPP_PUBLIC
   ~RclExecutor() override;
   RCLCPP_PUBLIC

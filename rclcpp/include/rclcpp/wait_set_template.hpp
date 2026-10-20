@@ -37,6 +37,10 @@
 
 namespace rclcpp
 {
+namespace experimental::executors
+{
+class RclExecutor;
+}
 
 /// Encapsulates sets of waitable items which can be waited on as a group.
 /**
@@ -46,6 +50,9 @@ namespace rclcpp
 template<class SynchronizationPolicy, class StoragePolicy>
 class WaitSetTemplate final : private SynchronizationPolicy, private StoragePolicy
 {
+  // The event-driven executor must preserve these slots without invoking rcl_wait.
+  friend class experimental::executors::RclExecutor;
+
 public:
   RCLCPP_SMART_PTR_DEFINITIONS_NOT_COPYABLE(WaitSetTemplate)
 
