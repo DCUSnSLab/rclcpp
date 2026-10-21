@@ -38,6 +38,14 @@ namespace rclcpp
  *
  * The convert functions must convert from one type to the other.
  *
+ * Optionally, the specialization may also provide
+ *
+ *     static std::shared_ptr<const custom_type>
+ *     convert_to_custom(std::shared_ptr<const ros_message_type>)
+ *
+ * which may reference the given message, keeping it alive, instead of copying it.
+ * Subscriptions with const callbacks use it for messages they receive as ROS messages.
+ *
  * For example, here is a theoretical example for adapting `std::string` to the
  * `std_msgs::msg::String` ROS message type:
  *

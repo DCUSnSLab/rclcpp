@@ -43,6 +43,15 @@ namespace detail
 template<class>
 inline constexpr bool always_false_v = false;
 
+template<typename AdapterT, typename = void>
+struct converts_to_shared_custom : std::false_type {};
+
+template<typename AdapterT>
+struct converts_to_shared_custom<AdapterT, std::void_t<decltype(
+    AdapterT::convert_to_custom(
+      std::declval<std::shared_ptr<const typename AdapterT::ros_message_type>>()))>>
+  : std::true_type {};
+
 template<typename MessageT, typename AllocatorT>
 struct MessageDeleterHelper
 {
@@ -483,8 +492,35 @@ public:
         using T = std::decay_t<decltype(callback)>;
         static constexpr bool is_ta = rclcpp::TypeAdapter<MessageT>::is_specialized::value;
 
+        static constexpr bool is_const_ta_callback = is_ta && (
+          std::is_same_v<T, ConstRefCallback>||
+          std::is_same_v<T, ConstRefWithInfoCallback>||
+          std::is_same_v<T, SharedConstPtrCallback>||
+          std::is_same_v<T, SharedConstPtrWithInfoCallback>||
+          std::is_same_v<T, ConstRefSharedConstPtrCallback>||
+          std::is_same_v<T, ConstRefSharedConstPtrWithInfoCallback>);
+
         // conditions for output is custom message
-        if constexpr (is_ta && std::is_same_v<T, ConstRefCallback>) {
+        if constexpr (  // NOLINT[readability/braces]
+          is_const_ta_callback &&
+          detail::converts_to_shared_custom<rclcpp::TypeAdapter<MessageT>>::value)
+        {
+          std::shared_ptr<const SubscribedType> shared =
+          rclcpp::TypeAdapter<MessageT>::convert_to_custom(
+            std::shared_ptr<const ROSMessageType>(message));
+          if constexpr (std::is_same_v<T, ConstRefCallback>) {
+            callback(*shared);
+          } else if constexpr (std::is_same_v<T, ConstRefWithInfoCallback>) {
+            callback(*shared, message_info);
+          } else if constexpr (  // NOLINT[readability/braces]
+            std::is_same_v<T, SharedConstPtrCallback>||
+            std::is_same_v<T, ConstRefSharedConstPtrCallback>)
+          {
+            callback(shared);
+          } else {
+            callback(shared, message_info);
+          }
+        } else if constexpr (is_ta && std::is_same_v<T, ConstRefCallback>) {
           // TODO(wjwwood): consider avoiding heap allocation for small messages
           //   maybe something like:
           // if constexpr (rosidl_generator_traits::has_fixed_size<T> && sizeof(T) < N) {
@@ -916,6 +952,15 @@ public:
       std::holds_alternative<SharedConstPtrWithInfoCallback>(callback_variant_) ||
       std::holds_alternative<ConstRefSharedConstPtrCallback>(callback_variant_) ||
       std::holds_alternative<ConstRefSharedConstPtrWithInfoCallback>(callback_variant_);
+  }
+
+  /// True if dispatch passes the received ROS message itself as a mutable shared pointer.
+  bool
+  receives_mutable_shared_ros_message() const
+  {
+    return
+      std::holds_alternative<SharedPtrROSMessageCallback>(callback_variant_) ||
+      std::holds_alternative<SharedPtrWithInfoROSMessageCallback>(callback_variant_);
   }
 
   constexpr

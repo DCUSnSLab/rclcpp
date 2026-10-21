@@ -33,6 +33,7 @@
 
 #include "rclcpp/allocator/allocator_common.hpp"
 #include "rclcpp/allocator/allocator_deleter.hpp"
+#include "rclcpp/detail/ipc_adapted.hpp"
 #include "rclcpp/detail/resolve_use_intra_process.hpp"
 #include "rclcpp/detail/resolve_intra_process_buffer_type.hpp"
 #include "rclcpp/experimental/buffers/intra_process_buffer.hpp"
@@ -41,6 +42,7 @@
 #include "rclcpp/get_message_type_support_handle.hpp"
 #include "rclcpp/is_ros_compatible_type.hpp"
 #include "rclcpp/loaned_message.hpp"
+#include "rclcpp/logging.hpp"
 #include "rclcpp/macros.hpp"
 #include "rclcpp/node_interfaces/node_base_interface.hpp"
 #include "rclcpp/publisher_base.hpp"
@@ -341,6 +343,12 @@ public:
   >
   publish(std::unique_ptr<T, PublishedTypeDeleter> msg)
   {
+    if constexpr (std::is_same_v<PublishedTypeDeleter, std::default_delete<T>>) {
+      if (rcl_publisher_is_ipc_enabled(this->publisher_handle_.get())) {
+        this->do_ipc_adapted_publish(std::move(msg));
+        return;
+      }
+    }
     if (!intra_process_is_enabled_) {
       // In this case we're not using intra process.
       auto ros_msg_ptr = std::make_unique<ROSMessageType>();
@@ -391,6 +399,14 @@ public:
   >
   publish(const T & msg)
   {
+    if constexpr (std::is_same_v<PublishedTypeDeleter, std::default_delete<T>>) {
+      if (rcl_publisher_is_ipc_enabled(this->publisher_handle_.get())) {
+        auto ros_msg = std::make_shared<ROSMessageType>();
+        rclcpp::TypeAdapter<MessageT>::convert_to_ros_message(msg, *ros_msg);
+        this->do_ipc_adapted_publish(std::make_unique<T>(msg), std::move(ros_msg));
+        return;
+      }
+    }
     if (!intra_process_is_enabled_) {
       // Convert to the ROS message equivalent and publish it.
       auto ros_msg_ptr = std::make_unique<ROSMessageType>();
@@ -469,6 +485,51 @@ public:
   }
 
 protected:
+  /// Give msg to the rcl broker, which converts it only for readers of the ROS message.
+  /**
+   * ros_msg, if given, is msg already converted.
+   */
+  void
+  do_ipc_adapted_publish(
+    std::unique_ptr<PublishedType> msg,
+    std::shared_ptr<ROSMessageType> ros_msg = nullptr)
+  {
+    using Adapted = rclcpp::detail::IpcAdapted<PublishedType, ROSMessageType>;
+    const bool converted = ros_msg != nullptr;
+    auto owner = new Adapted{std::move(msg),
+      converted ? std::move(ros_msg) : std::make_shared<ROSMessageType>()};
+    auto fill = [](void * value) {
+        auto adapted = static_cast<Adapted *>(value);
+        try {
+          rclcpp::TypeAdapter<MessageT>::convert_to_ros_message(*adapted->custom, *adapted->ros);
+        } catch (const std::exception & error) {
+          RCLCPP_ERROR(
+            rclcpp::get_logger("rclcpp"), "converting a type adapted message failed: %s",
+            error.what());
+          return false;
+        }
+        return true;
+      };
+    auto filled = [](void *) {return true;};
+    TRACETOOLS_TRACEPOINT(rclcpp_publish, nullptr, static_cast<const void *>(owner->ros.get()));
+    auto ret = rcl_publish_ipc_adapted(
+      publisher_handle_.get(), owner->ros.get(), Adapted::key(),
+      converted ? static_cast<bool (*)(void *)>(filled) : static_cast<bool (*)(void *)>(fill),
+      [](void * value) {delete static_cast<Adapted *>(value);}, owner);
+    if (RCL_RET_PUBLISHER_INVALID == ret) {
+      rcl_reset_error();
+      if (rcl_publisher_is_valid_except_context(publisher_handle_.get())) {
+        rcl_context_t * context = rcl_publisher_get_context(publisher_handle_.get());
+        if (nullptr != context && !rcl_context_is_valid(context)) {
+          return;
+        }
+      }
+    }
+    if (RCL_RET_OK != ret) {
+      rclcpp::exceptions::throw_from_rcl_error(ret, "failed to publish message");
+    }
+  }
+
   void
   do_inter_process_publish(const ROSMessageType & msg)
   {

@@ -32,6 +32,7 @@
 #include "rcl/subscription.h"
 
 #include "rclcpp/any_subscription_callback.hpp"
+#include "rclcpp/detail/ipc_adapted.hpp"
 #include "rclcpp/detail/resolve_use_intra_process.hpp"
 #include "rclcpp/detail/resolve_intra_process_buffer_type.hpp"
 #include "rclcpp/exceptions.hpp"
@@ -160,6 +161,18 @@ public:
     } else if (callback.is_serialized_message_callback()) {
       rcl_subscription_set_serialized_ipc(this->subscription_handle_.get());
     }
+    if constexpr (rclcpp::TypeAdapter<MessageT>::is_specialized::value) {
+      if (rcl_subscription_is_ipc_enabled(this->subscription_handle_.get())) {
+        auto take = std::make_shared<rclcpp::detail::IpcAdaptedTake>();
+        take->owner = static_cast<const SubscriptionBase *>(this);
+        take->key = rclcpp::detail::IpcAdapted<SubscribedType, ROSMessageType>::key();
+        take->handle = [this](const void * adapted, const std::shared_ptr<void> & holder,
+          const rclcpp::MessageInfo & message_info) {
+            this->handle_ipc_adapted_message(adapted, holder, message_info);
+          };
+        rclcpp::detail::set_ipc_adapted_take(this->subscription_handle_.get(), std::move(take));
+      }
+    }
     if (legacy_ipc) {
       using rclcpp::detail::resolve_intra_process_buffer_type;
 
@@ -224,6 +237,13 @@ public:
 #ifndef TRACETOOLS_DISABLED
     any_callback_.register_callback_for_tracing();
 #endif
+  }
+
+  ~Subscription()
+  {
+    if constexpr (rclcpp::TypeAdapter<MessageT>::is_specialized::value) {
+      rclcpp::detail::set_ipc_adapted_take(this->subscription_handle_.get(), nullptr);
+    }
   }
 
   /// Called after construction to continue setup that requires shared_from_this().
@@ -320,13 +340,37 @@ public:
       now = std::chrono::system_clock::now();
     }
 
+    // Broker messages are shared with other readers; every other callback kind copies or
+    // only reads them.
     if (message_info.get_rmw_message_info().from_intra_process &&
-      !any_callback_.use_take_shared_method())
+      any_callback_.receives_mutable_shared_ros_message())
     {
       typed_message = std::make_shared<ROSMessageType>(*typed_message);
     }
     any_callback_.dispatch(typed_message, message_info);
 
+    if (subscription_topic_statistics_) {
+      const auto nanos = std::chrono::time_point_cast<std::chrono::nanoseconds>(now);
+      const auto time = rclcpp::Time(nanos.time_since_epoch().count());
+      subscription_topic_statistics_->handle_message(message_info.get_rmw_message_info(), time);
+    }
+  }
+
+  /// Deliver the custom message of a type adapted publisher in this process; holder owns it.
+  void
+  handle_ipc_adapted_message(
+    const void * adapted,
+    const std::shared_ptr<void> & holder,
+    const rclcpp::MessageInfo & message_info)
+  {
+    using Adapted = rclcpp::detail::IpcAdapted<SubscribedType, ROSMessageType>;
+    std::shared_ptr<const SubscribedType> message(
+      holder, static_cast<const Adapted *>(adapted)->custom.get());
+    std::chrono::time_point<std::chrono::system_clock> now;
+    if (subscription_topic_statistics_) {
+      now = std::chrono::system_clock::now();
+    }
+    any_callback_.dispatch_intra_process(message, message_info);
     if (subscription_topic_statistics_) {
       const auto nanos = std::chrono::time_point_cast<std::chrono::nanoseconds>(now);
       const auto time = rclcpp::Time(nanos.time_since_epoch().count());

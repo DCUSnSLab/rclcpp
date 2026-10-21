@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "rcl/intra_process.h"
+#include "rclcpp/detail/ipc_adapted.hpp"
 
 #include "rcl/allocator.h"
 #include "rcl/error_handling.h"
@@ -615,13 +616,26 @@ Executor::execute_subscription(rclcpp::SubscriptionBase::SharedPtr subscription)
           // inter-process communication.
           rcl_ipc_message_t * owned = nullptr;
           const void * data = nullptr;
-          if (rcl_take_ipc_message(subscription->get_subscription_handle().get(), &owned,
-            &data, &message_info.get_rmw_message_info()) == RCL_RET_OK)
+          const void * adapted = nullptr;
+          auto handle = subscription->get_subscription_handle().get();
+          auto adapted_take = rclcpp::detail::get_ipc_adapted_take(handle);
+          if (adapted_take && adapted_take->owner != subscription.get()) {
+            adapted_take.reset();
+          }
+          if ((adapted_take ?
+            rcl_take_ipc_adapted(handle, adapted_take->key.c_str(), &owned, &adapted, &data,
+            &message_info.get_rmw_message_info()) :
+            rcl_take_ipc_message(handle, &owned, &data, &message_info.get_rmw_message_info())) ==
+            RCL_RET_OK)
           {
             std::shared_ptr<void> message(const_cast<void *>(data), [owned](void *) {
                 rcl_ipc_message_release(owned);
               });
-            subscription->handle_message(message, message_info);
+            if (adapted) {
+              adapted_take->handle(adapted, message, message_info);
+            } else {
+              subscription->handle_message(message, message_info);
+            }
             break;
           }
           std::shared_ptr<void> message = subscription->create_message();
