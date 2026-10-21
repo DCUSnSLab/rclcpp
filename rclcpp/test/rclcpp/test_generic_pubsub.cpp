@@ -310,3 +310,50 @@ TEST_F(RclcppGenericNodeFixture, generic_subscription_different_callbacks)
     ASSERT_TRUE(wait_for(connected, 5s));
   }
 }
+
+TEST_F(RclcppGenericNodeFixture, typed_publish_to_generic_and_typed_subscriptions)
+{
+  using namespace std::chrono_literals;
+  std::vector<std::string> generic_received;
+  std::vector<std::string> typed_received;
+  std::vector<bool> local;
+  auto publisher = node_->create_publisher<test_msgs::msg::Strings>("generic_fanout", 3);
+  auto generic_callback = [&](std::shared_ptr<const rclcpp::SerializedMessage> bytes,
+    const rclcpp::MessageInfo & info) {
+      test_msgs::msg::Strings decoded;
+      rclcpp::Serialization<test_msgs::msg::Strings> serializer;
+      serializer.deserialize_message(bytes.get(), &decoded);
+      generic_received.push_back(decoded.string_value);
+      local.push_back(info.get_rmw_message_info().from_intra_process);
+    };
+  auto first = node_->create_generic_subscription(
+    "generic_fanout", "test_msgs/msg/Strings", 3, generic_callback);
+  auto second = node_->create_generic_subscription(
+    "generic_fanout", "test_msgs/msg/Strings", 3, generic_callback);
+  auto serialized = node_->create_subscription<test_msgs::msg::Strings>(
+    "generic_fanout", 3, generic_callback);
+  auto typed = node_->create_subscription<test_msgs::msg::Strings>(
+    "generic_fanout", 3, [&](const test_msgs::msg::Strings & message) {
+      typed_received.push_back(message.string_value);
+    });
+  ASSERT_TRUE(wait_for([&] {return publisher->get_subscription_count() == 4;}, 5s));
+  const bool broker = rcl_subscription_is_ipc_enabled(typed->get_subscription_handle().get());
+  EXPECT_EQ(broker, rcl_subscription_is_ipc_enabled(first->get_subscription_handle().get()));
+  EXPECT_EQ(broker, rcl_subscription_is_ipc_enabled(second->get_subscription_handle().get()));
+  auto message = std::make_unique<test_msgs::msg::Strings>();
+  message->string_value = std::string(65536, 'a');
+  publisher->publish(std::move(message));
+  auto received = [&] {return generic_received.size() == 3 && typed_received.size() == 1;};
+  ASSERT_TRUE(wait_for(received, 5s));
+  EXPECT_EQ(typed_received[0], generic_received[0]);
+  EXPECT_EQ(typed_received[0], generic_received[1]);
+  EXPECT_EQ(typed_received[0], generic_received[2]);
+  EXPECT_EQ(broker, local[0]);
+  EXPECT_EQ(broker, local[1]);
+  EXPECT_EQ(broker, local[2]);
+  for (int i = 0; i < 10; ++i) {
+    rclcpp::spin_some(node_);
+  }
+  EXPECT_EQ(3u, generic_received.size());
+  EXPECT_EQ(1u, typed_received.size());
+}

@@ -42,7 +42,7 @@ namespace rclcpp
  * Since the type is not known at compile time, this is not a template, and the dynamic library
  * containing type support information has to be identified and loaded based on the type name.
  *
- * It does not support intra-process handling.
+ * Context-scoped rcl intra-process delivery supports serialized messages.
  */
 class GenericSubscription : public rclcpp::SubscriptionBase
 {
@@ -89,7 +89,11 @@ public:
     any_callback_(callback),
     ts_lib_(ts_lib)
   {
-    rcl_subscription_disable_ipc(this->get_subscription_handle().get());
+    if (options.use_intra_process_comm == rclcpp::IntraProcessSetting::Disable) {
+      rcl_subscription_disable_ipc(this->get_subscription_handle().get());
+    } else {
+      rcl_subscription_set_serialized_ipc(this->get_subscription_handle().get());
+    }
     TRACETOOLS_TRACEPOINT(
       rclcpp_subscription_init,
       static_cast<const void *>(get_subscription_handle().get()),

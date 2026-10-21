@@ -157,6 +157,8 @@ public:
     const bool legacy_ipc = rclcpp::detail::resolve_use_intra_process(options_, *node_base);
     if (legacy_ipc || options_.use_intra_process_comm == rclcpp::IntraProcessSetting::Disable) {
       rcl_subscription_disable_ipc(this->subscription_handle_.get());
+    } else if (callback.is_serialized_message_callback()) {
+      rcl_subscription_set_serialized_ipc(this->subscription_handle_.get());
     }
     if (legacy_ipc) {
       using rclcpp::detail::resolve_intra_process_buffer_type;
