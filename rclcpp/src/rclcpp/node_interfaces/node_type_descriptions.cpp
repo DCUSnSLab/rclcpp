@@ -93,11 +93,14 @@ public:
 
     if (enable_param.get<bool>()) {
       auto * rcl_node = node_base->get_rcl_node_handle();
+      // Like the other rclcpp handles, keep the node until the service is finalized: an executor
+      // may release the service handle after the node.
       std::shared_ptr<rcl_service_t> rcl_srv(
         new rcl_service_t,
-        [rcl_node, logger = this->logger_](rcl_service_t * service)
+        [node_handle = node_base->get_shared_rcl_node_handle(), logger = this->logger_](
+          rcl_service_t * service)
         {
-          if (rcl_service_fini(service, rcl_node) != RCL_RET_OK) {
+          if (rcl_service_fini(service, node_handle.get()) != RCL_RET_OK) {
             RCLCPP_ERROR(
               logger,
               "Error in destruction of rcl service handle [~/get_type_description]: %s",
