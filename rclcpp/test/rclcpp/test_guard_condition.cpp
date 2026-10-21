@@ -189,7 +189,7 @@ TEST_F(TestGuardCondition, mutable_trigger_callback)
 {
   rclcpp::GuardCondition gc;
   size_t observed = 0;
-  gc.set_on_trigger_callback([count = size_t{0}, &observed](size_t) mutable {
+  gc.set_on_trigger_callback([count = size_t{0}, &observed](auto) mutable {
       observed = ++count;
     });
   gc.trigger();
