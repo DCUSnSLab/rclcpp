@@ -23,7 +23,9 @@
 
 #include "rcl_executor/executor.h"
 #include "rcl_executor/trace.h"
+#include <rclcpp/event_handler.hpp>
 #include <rclcpp/exceptions.hpp>
+#include <rclcpp/logging.hpp>
 #include <rclcpp/experimental/subscription_intra_process_base.hpp>
 #include <rcpputils/scope_exit.hpp>
 #include "../../executor_implementation.hpp"
@@ -35,6 +37,16 @@ namespace
 void checked(rcl_ret_t result)
 {
   if (result != RCL_RET_OK) {rclcpp::exceptions::throw_from_rcl_error(result);}
+}
+
+// The rcl event the handler adds to a wait set; the handler keeps it for its lifetime.
+const rcl_event_t * event_of(Waitable & handler, rcl_context_t * context)
+{
+  auto ws = rcl_get_zero_initialized_wait_set();
+  checked(rcl_wait_set_init(&ws, 0, 0, 0, 0, 0, 1, context, rcl_get_default_allocator()));
+  RCPPUTILS_SCOPE_EXIT(checked(rcl_wait_set_fini(&ws)););
+  handler.add_to_wait_set(ws);
+  return ws.events[0];
 }
 }  // namespace
 
@@ -53,6 +65,7 @@ struct ExecutorCore::Impl
     std::mutex mutex;
     std::deque<int> events;
     bool guard_only = false;
+    std::function<void(size_t, int)> on_ready;
   };
   Executor & owner;
   rcl_executor_t * core = nullptr;
@@ -204,7 +217,7 @@ struct ExecutorCore::Impl
             };
           entities.emplace(waitable.get(), entity);
           changed = true;
-          waitable->set_on_ready_callback([this, weak_entity](size_t count, int id) {
+          entity->on_ready = [this, weak_entity](size_t count, int id) {
               auto e = weak_entity.lock();
               if (!e) {return;}
               if (policy == RCL_EXECUTOR_WAIT_SET) {
@@ -223,7 +236,28 @@ struct ExecutorCore::Impl
                 for (size_t i = 0; i < credits; ++i) {e->events.push_back(id);}
               }
               checked(rcl_executor_notify(core, e->id, credits));
-            });
+            };
+          // A QoS event goes to the rcl executor callback, so a callback the user set on it stays.
+          if (std::dynamic_pointer_cast<EventHandlerBase>(waitable)) {
+            auto event = event_of(*waitable, owner.context_->get_rcl_context().get());
+            checked(rcl_event_set_executor_callback(event,
+              [](const void * data, size_t count) {
+                try {
+                  (*static_cast<const std::function<void(size_t, int)> *>(data))(count, 0);
+                } catch (const std::exception & error) {
+                  RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "executor event: %s", error.what());
+                }
+              }, &entity->on_ready));
+            entity->clear = [weak_waitable, event] {
+                if (auto work = weak_waitable.lock()) {
+                  if (rcl_event_set_executor_callback(event, nullptr, nullptr) != RCL_RET_OK) {
+                    rcl_reset_error();
+                  }
+                }
+              };
+          } else {
+            waitable->set_on_ready_callback(entity->on_ready);
+          }
           if (policy == RCL_EXECUTOR_WAIT_SET) {
             checked(rcl_executor_notify(core, entity->id, 1));
           }
