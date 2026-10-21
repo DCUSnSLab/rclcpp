@@ -132,12 +132,14 @@ MultiThreadedExecutor::run(size_t this_thread_number)
 
     execute_any_executable(any_exec);
 
+    // A wait set that has the group already sees its work, so waking it would only cost an
+    // extra rcl_wait per callback (ros2/rclcpp#1148). The collection reads can_be_taken_from
+    // under mutex_, so a wait set built while the group was busy is seen here.
     if (any_exec.callback_group &&
-      any_exec.callback_group->type() == CallbackGroupType::MutuallyExclusive)
+      any_exec.callback_group->type() == CallbackGroupType::MutuallyExclusive &&
+      left_out_of_wait(any_exec))
     {
-      if (left_out_of_wait(any_exec)) {
-        entities_need_rebuild_.store(true);
-      }
+      entities_need_rebuild_.store(true);
       try {
         interrupt_guard_condition_->trigger();
       } catch (const rclcpp::exceptions::RCLError & ex) {
