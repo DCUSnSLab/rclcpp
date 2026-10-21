@@ -66,6 +66,7 @@ struct ExecutorCore::Impl
     std::deque<int> events;
     bool guard_only = false;
     std::function<void(size_t, int)> on_ready;
+    std::vector<uint64_t> observers;
   };
   Executor & owner;
   rcl_executor_t * core = nullptr;
@@ -126,6 +127,10 @@ struct ExecutorCore::Impl
     std::unique_lock<std::mutex> clock_guard;
     if (entity.clock) {clock_guard = std::unique_lock<std::mutex>(entity.clock->get_clock_mutex());}
     checked(rcl_executor_remove(core, entity.id));
+    for (auto id : entity.observers) {
+      checked(rcl_executor_remove(core, id));
+      sources.erase(id);
+    }
   }
 
   void sync()
@@ -165,6 +170,8 @@ struct ExecutorCore::Impl
           auto entity = std::make_shared<Entity>();
           entity->object = waitable;
           entity->group = group;
+          bool native_waitable = policy == RCL_EXECUTOR_WAIT_SET &&
+            waitable->get_number_of_ready_timers() > 0;
           entity->guard_only = !std::dynamic_pointer_cast<
             rclcpp::experimental::SubscriptionIntraProcessBase>(waitable) &&
             waitable->get_number_of_ready_guard_conditions() > 0 &&
@@ -178,7 +185,8 @@ struct ExecutorCore::Impl
           checked(rcl_executor_add(core, policy == RCL_EXECUTOR_WAIT_SET ?
               RCL_EXECUTOR_WAITABLE : RCL_EXECUTOR_WORK, nullptr, waitable.get(),
               group_id, &entity->id));
-          entity->execute = [this, weak_entity, weak_waitable](const rcl_executor_item_t &) {
+          entity->execute = [this, weak_entity, weak_waitable, native_waitable](
+            const rcl_executor_item_t &) {
               auto e = weak_entity.lock();
               auto work = weak_waitable.lock();
               if (!e || !work) {return false;}
@@ -202,7 +210,11 @@ struct ExecutorCore::Impl
                 auto result = rcl_wait(&ws, 0);
                 if (result != RCL_RET_TIMEOUT) {checked(result);}
                 if (!work->is_ready(ws)) {return false;}
-                RCPPUTILS_SCOPE_EXIT(checked(rcl_executor_notify(core, e->id, 1)););
+                RCPPUTILS_SCOPE_EXIT(
+                  if (!native_waitable && !std::dynamic_pointer_cast<EventHandlerBase>(work)) {
+                checked(rcl_executor_notify(core, e->id, 1));
+                  }
+                );
                 const auto ready_data = work->take_data();
                 work->execute(ready_data);
                 return true;
@@ -212,11 +224,37 @@ struct ExecutorCore::Impl
               work->execute(static_cast<const std::shared_ptr<void> &>(data));
               return true;
             };
-          entity->clear = [weak_waitable] {
-              if (auto work = weak_waitable.lock()) {work->clear_on_ready_callback();}
-            };
           entities.emplace(waitable.get(), entity);
           changed = true;
+          if (native_waitable) {
+            // The waitable owns its raw handles until its registrations are removed.
+            entity->handle = waitable;
+            auto ws = rcl_get_zero_initialized_wait_set();
+            checked(rcl_wait_set_init(&ws,
+                waitable->get_number_of_ready_subscriptions(),
+                waitable->get_number_of_ready_guard_conditions(),
+                waitable->get_number_of_ready_timers(), waitable->get_number_of_ready_clients(),
+                waitable->get_number_of_ready_services(), waitable->get_number_of_ready_events(),
+                owner.context_->get_rcl_context().get(), rcl_get_default_allocator()));
+            RCPPUTILS_SCOPE_EXIT(checked(rcl_wait_set_fini(&ws)););
+            waitable->add_to_wait_set(ws);
+            auto observe = [&](auto handles, size_t count, rcl_executor_entity_type_t type) {
+                for (size_t i = 0; i < count; ++i) {
+                  if (!handles[i]) {continue;}
+                  uint64_t id;
+                  checked(rcl_executor_add(core, type, handles[i], waitable.get(), group_id, &id));
+                  entity->observers.push_back(id);
+                  sources.emplace(id, entity);
+                }
+              };
+            observe(ws.timers, ws.size_of_timers, RCL_EXECUTOR_TIMER_OBSERVER);
+            observe(ws.subscriptions, ws.size_of_subscriptions, RCL_EXECUTOR_SUBSCRIPTION);
+            observe(ws.guard_conditions, ws.size_of_guard_conditions, RCL_EXECUTOR_GUARD_CONDITION);
+            observe(ws.clients, ws.size_of_clients, RCL_EXECUTOR_CLIENT);
+            observe(ws.services, ws.size_of_services, RCL_EXECUTOR_SERVICE);
+            observe(ws.events, ws.size_of_events, RCL_EXECUTOR_EVENT);
+            return;
+          }
           entity->on_ready = [this, weak_entity](size_t count, int id) {
               auto e = weak_entity.lock();
               if (!e) {return;}
@@ -257,6 +295,9 @@ struct ExecutorCore::Impl
               };
           } else {
             waitable->set_on_ready_callback(entity->on_ready);
+            entity->clear = [weak_waitable] {
+                if (auto work = weak_waitable.lock()) {work->clear_on_ready_callback();}
+              };
           }
           if (policy == RCL_EXECUTOR_WAIT_SET) {
             checked(rcl_executor_notify(core, entity->id, 1));
@@ -344,6 +385,9 @@ struct ExecutorCore::Impl
             auto found = entities.find(pointer.get());
             if (found != entities.end() && found->second->order != i) {
               checked(rcl_executor_set_order(core, found->second->id, i));
+              for (auto id : found->second->observers) {
+                checked(rcl_executor_set_order(core, id, i));
+              }
               found->second->order = i;
             }
           }

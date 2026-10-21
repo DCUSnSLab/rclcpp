@@ -27,6 +27,70 @@
 #include <rclcpp/experimental/executors/rcl_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+namespace
+{
+class LegacyTimerWaitable : public rclcpp::Waitable
+{
+public:
+  LegacyTimerWaitable(rclcpp::Node & node, std::function<void()> callback)
+  : clock_(node.get_clock()), context_(node.get_node_base_interface()->get_context()),
+    callback_(std::move(callback))
+  {
+    auto ret = rcl_timer_init2(&timer_, clock_->get_clock_handle(),
+        context_->get_rcl_context().get(), 5000000, nullptr, rcl_get_default_allocator(), true);
+    if (ret != RCL_RET_OK) {rclcpp::exceptions::throw_from_rcl_error(ret);}
+  }
+  ~LegacyTimerWaitable() override {EXPECT_EQ(RCL_RET_OK, rcl_timer_fini(&timer_));}
+  size_t get_number_of_ready_timers() override {return 1;}
+  void add_to_wait_set(rcl_wait_set_t & wait) override
+  {
+    ASSERT_EQ(RCL_RET_OK, rcl_wait_set_add_timer(&wait, &timer_, &index_));
+  }
+  bool is_ready(const rcl_wait_set_t & wait) override {return wait.timers[index_] != nullptr;}
+  std::shared_ptr<void> take_data() override {return nullptr;}
+  void execute(const std::shared_ptr<void> &) override
+  {
+    ASSERT_EQ(RCL_RET_OK, rcl_timer_call(&timer_));
+    callback_();
+  }
+
+private:
+  rcl_timer_t timer_ = rcl_get_zero_initialized_timer();
+  size_t index_ = 0;
+  rclcpp::Clock::SharedPtr clock_;
+  rclcpp::Context::SharedPtr context_;
+  std::function<void()> callback_;
+};
+}  // namespace
+
+TEST(RclExecutor, legacy_waitable_timer_wakes_repeats_and_detaches)
+{
+  rclcpp::init(0, nullptr);
+  for (size_t threads : {1u, 2u}) {
+    auto node = std::make_shared<rclcpp::Node>("legacy_waitable_timer");
+    auto group = node->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    rclcpp::experimental::executors::RclExecutor executor(
+      rclcpp::ExecutorOptions(), threads, RCL_EXECUTOR_WAIT_SET);
+    int calls = 0;
+    auto work = std::make_shared<LegacyTimerWaitable>(*node, [&] {
+          if (++calls == 3) {executor.cancel();}
+        });
+    node->get_node_waitables_interface()->add_waitable(work, group);
+    auto timeout = node->create_wall_timer(std::chrono::seconds(1), [&] {executor.cancel();});
+    executor.add_node(node);
+    executor.spin();
+    EXPECT_EQ(3, calls);
+    node->get_node_waitables_interface()->remove_waitable(work, group);
+    node->get_node_base_interface()->trigger_notify_guard_condition();
+    executor.spin_some();
+    std::weak_ptr<LegacyTimerWaitable> released = work;
+    work.reset();
+    EXPECT_TRUE(released.expired());
+    executor.remove_node(node);
+  }
+  rclcpp::shutdown();
+}
+
 TEST(RclExecutor, spin_some_does_not_claim_a_second_timer_tick)
 {
   rclcpp::init(0, nullptr);
