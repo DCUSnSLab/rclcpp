@@ -683,11 +683,18 @@ void
 Executor::execute_service(rclcpp::ServiceBase::SharedPtr service)
 {
   auto request_header = service->create_request_header();
-  std::shared_ptr<void> request = service->create_request();
+  std::shared_ptr<void> request;
   take_and_do_error_handling(
     "taking a service server request from service",
     service->get_service_name(),
-    [&]() {return service->take_type_erased_request(request.get(), *request_header);},
+    [&]() {
+      request = service->take_ipc_request(*request_header);
+      if (request) {
+        return true;
+      }
+      request = service->create_request();
+      return service->take_type_erased_request(request.get(), *request_header);
+    },
     [&]() {service->handle_request(request_header, request);});
 }
 
@@ -695,11 +702,18 @@ void
 Executor::execute_client(rclcpp::ClientBase::SharedPtr client)
 {
   auto request_header = client->create_request_header();
-  std::shared_ptr<void> response = client->create_response();
+  std::shared_ptr<void> response;
   take_and_do_error_handling(
     "taking a service client response from service",
     client->get_service_name(),
-    [&]() {return client->take_type_erased_response(response.get(), *request_header);},
+    [&]() {
+      response = client->take_ipc_response(*request_header);
+      if (response) {
+        return true;
+      }
+      response = client->create_response();
+      return client->take_type_erased_response(response.get(), *request_header);
+    },
     [&]() {client->handle_response(request_header, response);});
 }
 

@@ -102,6 +102,30 @@ public:
   bool
   take_type_erased_request(void * request_out, rmw_request_id_t & request_id_out);
 
+  /// Take a request from the rcl intra-process broker without copying it.
+  /**
+   * \returns the request, or nullptr when the broker holds none.
+   */
+  RCLCPP_PUBLIC
+  std::shared_ptr<void>
+  take_ipc_request(rmw_request_id_t & request_id_out);
+
+  /// A default response that can reach the requesting local client without a copy.
+  /**
+   * \returns the response, or nullptr when the request did not come through the broker.
+   */
+  RCLCPP_PUBLIC
+  std::shared_ptr<void>
+  borrow_ipc_response(const rmw_request_id_t & request_id);
+
+  /// Send a response from borrow_ipc_response() that nothing else references.
+  /**
+   * \returns false if the response was not borrowed, in which case nothing was sent.
+   */
+  RCLCPP_PUBLIC
+  bool
+  send_ipc_response(rmw_request_id_t & request_id, const std::shared_ptr<void> & response);
+
   virtual
   std::shared_ptr<void>
   create_request() = 0;
@@ -477,6 +501,9 @@ public:
     auto typed_request = std::static_pointer_cast<typename ServiceT::Request>(request);
     auto response = any_callback_.dispatch(this->shared_from_this(), request_header, typed_request);
     if (response) {
+      if (response.use_count() == 1 && this->send_ipc_response(*request_header, response)) {
+        return;
+      }
       send_response(*request_header, *response);
     }
   }

@@ -18,6 +18,7 @@
 #include <string>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "rclcpp/exceptions.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -26,6 +27,7 @@
 #include "../utils/rclcpp_gtest_macros.hpp"
 
 #include "rcl_interfaces/srv/list_parameters.hpp"
+#include "test_msgs/srv/basic_types.hpp"
 #include "test_msgs/srv/empty.hpp"
 #include "test_msgs/srv/empty.h"
 
@@ -399,4 +401,77 @@ TEST_F(TestService, server_qos_depth) {
   rclcpp::spin_some(server_node);
 
   EXPECT_EQ(server_cb_count_, server_qos_profile.depth());
+}
+
+TEST_F(TestService, responses_start_from_defaults) {
+  using S = test_msgs::srv::BasicTypes;
+  std::vector<S::Request::SharedPtr> requests;
+  auto server = node->create_service<S>(
+    "fresh_responses", [&](S::Request::SharedPtr request, S::Response::SharedPtr response) {
+      if (request->int64_value == 0) {
+        response->string_value = request->string_value;
+      }
+      response->int64_value = request->int64_value;
+      requests.push_back(request);
+    });
+  auto client = node->create_client<S>("fresh_responses");
+  ASSERT_TRUE(client->wait_for_service(5s));
+  auto call = [&](int64_t value) {
+      auto request = std::make_shared<S::Request>();
+      request->int64_value = value;
+      request->string_value = std::string(4096, static_cast<char>('a' + value));
+      auto future = client->async_send_request(request);
+      EXPECT_EQ(
+        rclcpp::FutureReturnCode::SUCCESS, rclcpp::spin_until_future_complete(node, future, 5s));
+      return future.get();
+    };
+  EXPECT_EQ(std::string(4096, 'a'), call(0)->string_value);
+  auto kept = call(1);
+  EXPECT_EQ(1, kept->int64_value);
+  EXPECT_EQ("", kept->string_value);
+  EXPECT_EQ(std::string(4096, 'a'), call(0)->string_value);
+  EXPECT_EQ(1, kept->int64_value);
+  EXPECT_EQ("", kept->string_value);
+  ASSERT_EQ(3u, requests.size());
+  EXPECT_EQ(std::string(4096, 'a'), requests[0]->string_value);
+  EXPECT_EQ(std::string(4096, 'b'), requests[1]->string_value);
+  EXPECT_EQ(1, requests[1]->int64_value);
+}
+
+TEST_F(TestService, deferred_and_retained_responses) {
+  using S = test_msgs::srv::BasicTypes;
+  rclcpp::Service<S>::SharedPtr server;
+  std::vector<std::pair<rmw_request_id_t, S::Request::SharedPtr>> pending;
+  server = node->create_service<S>(
+    "deferred_responses", [&](
+      std::shared_ptr<rmw_request_id_t> header, S::Request::SharedPtr request) {
+      pending.emplace_back(*header, request);
+    });
+  auto client = node->create_client<S>("deferred_responses");
+  ASSERT_TRUE(client->wait_for_service(5s));
+  std::vector<rclcpp::Client<S>::SharedFuture> futures;
+  for (int64_t value = 0; value < 2; ++value) {
+    auto request = std::make_shared<S::Request>();
+    request->int64_value = value;
+    futures.push_back(client->async_send_request(request).future.share());
+  }
+  auto start = std::chrono::steady_clock::now();
+  while (pending.size() < 2 && std::chrono::steady_clock::now() - start < 5s) {
+    rclcpp::spin_some(node);
+  }
+  ASSERT_EQ(2u, pending.size());
+  S::Response response;
+  for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+    response.int64_value = it->second->int64_value + 100;
+    response.string_value = std::string(2048, 'z');
+    server->send_response(it->first, response);
+  }
+  response.string_value = "changed";
+  for (auto & future : futures) {
+    ASSERT_EQ(
+      rclcpp::FutureReturnCode::SUCCESS, rclcpp::spin_until_future_complete(node, future, 5s));
+  }
+  EXPECT_EQ(100, futures[0].get()->int64_value);
+  EXPECT_EQ(101, futures[1].get()->int64_value);
+  EXPECT_EQ(std::string(2048, 'z'), futures[0].get()->string_value);
 }

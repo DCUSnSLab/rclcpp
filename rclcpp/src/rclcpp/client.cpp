@@ -21,6 +21,7 @@
 #include <string>
 
 #include "rcl/graph.h"
+#include "rcl/intra_process.h"
 #include "rcl/node.h"
 #include "rcl/wait.h"
 
@@ -80,6 +81,22 @@ ClientBase::take_type_erased_response(void * response_out, rmw_request_id_t & re
     rclcpp::exceptions::throw_from_rcl_error(ret);
   }
   return true;
+}
+
+std::shared_ptr<void>
+ClientBase::take_ipc_response(rmw_request_id_t & request_header_out)
+{
+  rmw_service_info_t info;
+  rcl_ipc_message_t * message = nullptr;
+  void * data = nullptr;
+  rcl_ret_t ret = rcl_take_ipc_response(this->get_client_handle().get(), &info, &message, &data);
+  if (RCL_RET_CLIENT_TAKE_FAILED == ret) {
+    return nullptr;
+  } else if (RCL_RET_OK != ret) {
+    rclcpp::exceptions::throw_from_rcl_error(ret);
+  }
+  request_header_out = info.request_id;
+  return std::shared_ptr<void>(data, [message](void *) {rcl_ipc_message_release(message);});
 }
 
 const char *

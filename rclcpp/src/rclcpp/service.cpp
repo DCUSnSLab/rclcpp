@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 
+#include "rcl/intra_process.h"
 #include "rclcpp/any_service_callback.hpp"
 #include "rclcpp/macros.hpp"
 #include "rclcpp/qos.hpp"
@@ -45,6 +46,68 @@ ServiceBase::take_type_erased_request(void * request_out, rmw_request_id_t & req
     return false;
   } else if (RCL_RET_OK != ret) {
     rclcpp::exceptions::throw_from_rcl_error(ret);
+  }
+  return true;
+}
+
+namespace
+{
+struct IpcMessageRelease
+{
+  rcl_ipc_message_t * message;
+  void operator()(void *) const {rcl_ipc_message_release(message);}
+};
+}  // namespace
+
+std::shared_ptr<void>
+ServiceBase::take_ipc_request(rmw_request_id_t & request_id_out)
+{
+  rmw_service_info_t info;
+  rcl_ipc_message_t * message = nullptr;
+  void * data = nullptr;
+  rcl_ret_t ret = rcl_take_ipc_request(this->get_service_handle().get(), &info, &message, &data);
+  if (RCL_RET_SERVICE_TAKE_FAILED == ret) {
+    return nullptr;
+  } else if (RCL_RET_OK != ret) {
+    rclcpp::exceptions::throw_from_rcl_error(ret);
+  }
+  request_id_out = info.request_id;
+  return std::shared_ptr<void>(data, IpcMessageRelease{message});
+}
+
+std::shared_ptr<void>
+ServiceBase::borrow_ipc_response(const rmw_request_id_t & request_id)
+{
+  rcl_ipc_message_t * message = nullptr;
+  void * data = nullptr;
+  rcl_ret_t ret = rcl_borrow_ipc_response(
+    this->get_service_handle().get(), &request_id, &message, &data);
+  if (RCL_RET_UNSUPPORTED == ret) {
+    return nullptr;
+  } else if (RCL_RET_OK != ret) {
+    rclcpp::exceptions::throw_from_rcl_error(ret);
+  }
+  return std::shared_ptr<void>(data, IpcMessageRelease{message});
+}
+
+bool
+ServiceBase::send_ipc_response(
+  rmw_request_id_t & request_id, const std::shared_ptr<void> & response)
+{
+  auto borrowed = std::get_deleter<IpcMessageRelease>(response);
+  if (!borrowed) {
+    return false;
+  }
+  rcl_ret_t ret = rcl_send_ipc_response(
+    this->get_service_handle().get(), &request_id, borrowed->message);
+  if (RCL_RET_TIMEOUT == ret) {
+    RCLCPP_WARN(
+      node_logger_.get_child("rclcpp"),
+      "failed to send response to %s (timeout): %s",
+      this->get_service_name(), rcl_get_error_string().str);
+    rcl_reset_error();
+  } else if (RCL_RET_OK != ret) {
+    rclcpp::exceptions::throw_from_rcl_error(ret, "failed to send response");
   }
   return true;
 }

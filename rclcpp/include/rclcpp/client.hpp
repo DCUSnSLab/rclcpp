@@ -179,6 +179,14 @@ public:
   bool
   take_type_erased_response(void * response_out, rmw_request_id_t & request_header_out);
 
+  /// Take a response from the rcl intra-process broker without copying it.
+  /**
+   * \returns the response, or nullptr when the broker holds none.
+   */
+  RCLCPP_PUBLIC
+  std::shared_ptr<void>
+  take_ipc_response(rmw_request_id_t & request_header_out);
+
   /// Return the name of the service.
   /** \return The name of the service. */
   RCLCPP_PUBLIC
