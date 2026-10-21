@@ -36,6 +36,8 @@ public:
   RclExecutor(
     const ExecutorOptions & options, Mode mode,
     rcl_executor_selection_policy_t selection_policy = RCL_EXECUTOR_WAIT_SET);
+  // Index 0 of a shared executor is the thread that calls spin(); attributes the callback sets
+  // there remain after spin() returns. Partition mode calls it only on the threads it creates.
   using ThreadStart = std::function<void(size_t, CallbackGroup::SharedPtr)>;
   RCLCPP_PUBLIC
   void on_thread_start(ThreadStart callback);
