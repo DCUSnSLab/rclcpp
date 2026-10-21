@@ -330,7 +330,7 @@ TEST_F(TestWaitSet, failed_removal_preserves_entity_ownership) {
   EXPECT_THROW(other.remove_service(nullptr), std::invalid_argument);
 
   rclcpp::PublisherOptions publisher_options;
-  publisher_options.event_callbacks.deadline_callback = [](rclcpp::QOSDeadlineOfferedInfo &) {};
+  publisher_options.event_callbacks.matched_callback = [](rclcpp::MatchedInfo &) {};
   auto pub = node->create_publisher<test_msgs::msg::BasicTypes>("~/test", 1, publisher_options);
   auto qos_event = pub->get_event_handlers().begin()->second;
   owner.add_waitable(qos_event, pub);
