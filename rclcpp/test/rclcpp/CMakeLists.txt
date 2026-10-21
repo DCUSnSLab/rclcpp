@@ -677,3 +677,11 @@ ament_add_gtest(test_rcl_executor
 if(TARGET test_rcl_executor)
   target_link_libraries(test_rcl_executor ${PROJECT_NAME} ${test_msgs_TARGETS})
 endif()
+
+ament_add_gtest(test_events_cbg_executor_queue executors/test_events_cbg_executor_queue.cpp
+  APPEND_LIBRARY_DIRS "${append_library_dirs}")
+if(TARGET test_events_cbg_executor_queue)
+  target_include_directories(test_events_cbg_executor_queue PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
+  target_link_libraries(test_events_cbg_executor_queue ${PROJECT_NAME} ${test_msgs_TARGETS})
+endif()

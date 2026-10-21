@@ -46,6 +46,8 @@ struct ReadyEntity
 
   explicit ReadyEntity(const rclcpp::SubscriptionBase::WeakPtr ptr)
   : entity(ptr), id(GlobalEventIdProvider::get_next_id()) {}
+  ReadyEntity(const rclcpp::SubscriptionBase::WeakPtr ptr, std::shared_ptr<size_t> queued)
+  : entity(ptr), id(GlobalEventIdProvider::get_next_id()), queued_for_entity(std::move(queued)) {}
   explicit ReadyEntity(const ReadyTimerWithExecutedCallback & timer)
   : entity(timer), id(GlobalEventIdProvider::get_next_id()) {}
   explicit ReadyEntity(const rclcpp::ServiceBase::WeakPtr ptr)
@@ -123,6 +125,9 @@ struct ReadyEntity
   }
 
   GlobalEventIdProvider::MonotonicId id;
+
+  /// Events of the same entity in the queue, guarded by the ready mutex of the callback group.
+  std::shared_ptr<size_t> queued_for_entity;
 
     /**
      * Returns true if the event has expired / does not need to be executed any more

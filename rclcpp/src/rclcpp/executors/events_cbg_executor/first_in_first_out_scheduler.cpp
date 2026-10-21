@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "first_in_first_out_scheduler.hpp"
+#include <algorithm>
+#include <memory>
 #include <utility>
 
 namespace rclcpp
@@ -23,11 +25,31 @@ namespace cbg_executor
 std::function<void(size_t)> FirstInFirstOutCallbackGroupHandle::get_ready_callback_for_entity(
   const rclcpp::SubscriptionBase::WeakPtr & entity)
 {
-  return [weak_ptr = entity, this](size_t nr_msg) {
+  // A KEEP_LAST subscription holds at most depth messages, so further events would only fail to
+  // take. Not queueing them bounds the queue while the group is busy (ros2/rclcpp#3213).
+  size_t depth = 0;
+  if (auto subscription = entity.lock()) {
+    const rclcpp::QoS qos = subscription->get_actual_qos();
+    if (qos.history() == rclcpp::HistoryPolicy::KeepLast) {
+      depth = qos.depth();
+    }
+  }
+  if (depth == 0) {
+    return [weak_ptr = entity, this](size_t nr_msg) {
+             add_ready_entity([&] () {
+                 for (size_t i = 0; i < nr_msg; i++) {
+                   ready_entities.emplace_back(weak_ptr);
+                 }
+              });
+           };
+  }
+  return [weak_ptr = entity, this, depth, queued = std::make_shared<size_t>(0)](size_t nr_msg) {
            add_ready_entity([&] () {
+               nr_msg = std::min(nr_msg, depth - *queued);
                for (size_t i = 0; i < nr_msg; i++) {
-                 ready_entities.emplace_back(weak_ptr);
+                 ready_entities.emplace_back(weak_ptr, queued);
                }
+               *queued += nr_msg;
             });
          };
 }
@@ -101,6 +123,9 @@ get_next_ready_entity()
     auto & first = ready_entities.front();
 
     std::function<void()> exec_fun = first.get_execute_function();
+    if (first.queued_for_entity) {
+      --*first.queued_for_entity;
+    }
     ready_entities.pop_front();
     if(!exec_fun) {
       // was deleted, or in case of timer was canceled
@@ -129,6 +154,9 @@ get_next_ready_entity(GlobalEventIdProvider::MonotonicId max_id)
     }
 
     std::function<void()> exec_fun = first.get_execute_function();
+    if (first.queued_for_entity) {
+      --*first.queued_for_entity;
+    }
     ready_entities.pop_front();
     if(!exec_fun) {
       // was deleted, or in case of timer was canceled
