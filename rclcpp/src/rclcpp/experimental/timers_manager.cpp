@@ -19,11 +19,33 @@
 #include <ctime>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "rcpputils/scope_exit.hpp"
 
 using rclcpp::experimental::TimersManager;
+
+namespace
+{
+// Timers whose event was handed to on_ready_callback_ and not yet consumed by
+// execute_ready_timer(). Kept outside TimersManager to preserve its layout.
+struct QueuedTimers
+{
+  std::mutex mutex;
+  std::unordered_map<const TimersManager *,
+    std::unordered_set<const rclcpp::TimerBase *>> by_manager;
+};
+
+// Leaked so that a TimersManager destroyed during static destruction can still use it.
+QueuedTimers & queued_timers()
+{
+  static auto * queued = new QueuedTimers;
+  return *queued;
+}
+}  // namespace
 
 TimersManager::TimersManager(
   std::shared_ptr<rclcpp::Context> context,
@@ -40,6 +62,10 @@ TimersManager::~TimersManager()
 
   // Make sure timers thread is stopped before destroying this object
   this->stop();
+
+  auto & queued = queued_timers();
+  std::lock_guard<std::mutex> lock(queued.mutex);
+  queued.by_manager.erase(this);
 }
 
 void TimersManager::add_timer(rclcpp::TimerBase::SharedPtr timer)
@@ -165,6 +191,14 @@ void TimersManager::execute_ready_timer(
   const rclcpp::TimerBase * timer_id,
   const std::shared_ptr<void> & data)
 {
+  {
+    auto & queued = queued_timers();
+    std::lock_guard<std::mutex> lock(queued.mutex);
+    auto it = queued.by_manager.find(this);
+    if (it != queued.by_manager.end()) {
+      it->second.erase(timer_id);
+    }
+  }
   TimerPtr ready_timer;
   {
     std::unique_lock<std::mutex> lock(timers_mutex_);
@@ -224,7 +258,17 @@ void TimersManager::execute_ready_timers_unsafe()
     auto data = head_timer->call();
     if (data) {
       if (on_ready_callback_) {
-        on_ready_callback_(head_timer.get(), data);
+        // A timer that overran its period already has an event waiting: like a wait set
+        // executor, run it once more instead of once per missed period (ros2/rclcpp#2771).
+        bool newly_queued = false;
+        {
+          auto & queued = queued_timers();
+          std::lock_guard<std::mutex> lock(queued.mutex);
+          newly_queued = queued.by_manager[this].insert(head_timer.get()).second;
+        }
+        if (newly_queued) {
+          on_ready_callback_(head_timer.get(), data);
+        }
       } else {
         head_timer->execute_callback(data);
       }

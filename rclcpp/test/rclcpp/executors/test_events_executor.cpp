@@ -17,6 +17,8 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "rclcpp/experimental/executors/events_executor/events_executor.hpp"
 #include "rclcpp/executors/executor_notify_waitable.hpp"
@@ -516,4 +518,36 @@ TEST_F(TestEventsExecutor, rcl_guard_condition_in_waitable)
   ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard->get_rcl_guard_condition()));
   executor.spin_some();
   EXPECT_EQ(3u, executions);
+}
+
+// ros2/rclcpp#2771: a timer that overran its period must not leave a backlog of timer events
+// that run back to back once the callback is fast again.
+TEST_F(TestEventsExecutor, overrunning_timer_does_not_burst)
+{
+  auto node = std::make_shared<rclcpp::Node>("overrunning_timer");
+  EventsExecutor executor;
+  executor.add_node(node);
+
+  std::vector<std::chrono::steady_clock::time_point> starts;
+  auto timer = node->create_wall_timer(
+    30ms,
+    [&]() {
+      starts.push_back(std::chrono::steady_clock::now());
+      if (starts.size() <= 4u) {
+        std::this_thread::sleep_for(100ms);
+      } else if (starts.size() == 12u) {
+        executor.cancel();
+      }
+    });
+
+  executor.spin();
+
+  ASSERT_EQ(12u, starts.size());
+  size_t back_to_back = 0;
+  for (size_t i = 1; i < starts.size(); ++i) {
+    if (starts[i] - starts[i - 1] < 5ms) {
+      ++back_to_back;
+    }
+  }
+  EXPECT_EQ(0u, back_to_back);
 }
