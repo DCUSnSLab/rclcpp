@@ -52,6 +52,14 @@ struct converts_to_shared_custom<AdapterT, std::void_t<decltype(
       std::declval<std::shared_ptr<const typename AdapterT::ros_message_type>>()))>>
   : std::true_type {};
 
+// Names AdapterT through a type that depends on T, so that clang only checks the call when the
+// branch is taken.
+template<typename T, typename AdapterT>
+struct dependent_adapter
+{
+  using type = AdapterT;
+};
+
 template<typename MessageT, typename AllocatorT>
 struct MessageDeleterHelper
 {
@@ -505,9 +513,10 @@ public:
           is_const_ta_callback &&
           detail::converts_to_shared_custom<rclcpp::TypeAdapter<MessageT>>::value)
         {
+          using Adapter =
+          typename detail::dependent_adapter<T, rclcpp::TypeAdapter<MessageT>>::type;
           std::shared_ptr<const SubscribedType> shared =
-          rclcpp::TypeAdapter<MessageT>::convert_to_custom(
-            std::shared_ptr<const ROSMessageType>(message));
+          Adapter::convert_to_custom(std::shared_ptr<const ROSMessageType>(message));
           if constexpr (std::is_same_v<T, ConstRefCallback>) {
             callback(*shared);
           } else if constexpr (std::is_same_v<T, ConstRefWithInfoCallback>) {
