@@ -2,13 +2,16 @@
 
 This package embeds real C++ and Python nodes using a shared rcl context. It tests
 the opt-in context broker, the ordinary RMW path, and the existing C++ IPM path.
-Build `rmw`, `rmw_zenoh_cpp`, `rcl`, `rclcpp`, `rclpy`, and this package into an
-isolated overlay; `zenoh_cpp_vendor` can come from the underlay.
+Build `rmw`, `zenoh_cpp_vendor`, `rmw_zenoh_cpp`, `rcl`, `rclcpp`, `rclpy`, and
+this package into an overlay. Build `zenoh_cpp_vendor` from the same `rmw_zenoh`
+fork as `rmw_zenoh_cpp` (zenoh-c 1.10.1): the fork's default configuration uses
+zenoh 1.10 keys, so the Jazzy binary vendor (zenoh-c 1.8.0) cannot be reused.
+Use the router from the same overlay.
 
 After sourcing the overlay, add its `lib/rcl_ipc_integration` directory to
-`PYTHONPATH`. Configure Zenoh normally; the sandbox validation used a localhost
-router with client sessions. Set `ROS_DOMAIN_ID=175`. Enable the broker before
-initializing any context with `RCL_INTRA_PROCESS=1` (default off).
+`PYTHONPATH`. Set `RMW_IMPLEMENTATION=rmw_zenoh_cpp` and run a router on a port
+that no other session uses. Enable the broker before initializing any context with
+`RCL_INTRA_PROCESS=1` (default off).
 
 `Container.lease()` returns a capsule named `rcl_context_shared_ptr` holding a
 shared pointer to its actual rcl context. Python calls
@@ -33,11 +36,12 @@ a raw reader, and a remote reader each receive local and remote publications onc
 Set `ROS_EXECUTOR_CORE=0` for classic executors or `1` for the common executor.
 
 `matrix.py` accepts `--pair cc|cp|pc|pp`, `--bytes`, `--samples`, and `--legacy`
-(the last only for C++/C++). It checks every payload/sequence. It expects the
-scoped libmemcount preloader exported in the task's phase1 validation directory.
-Use `--functional` when the one-minute system load is at least 2; that mode never
+(the last only for C++/C++). It checks every payload/sequence. It needs a
+payload-copy counter preloaded with `LD_PRELOAD` that exports `memcount_reset`,
+`memcount_pause`, `memcount_resume` and `memcount_stop`; that library is not part
+of this package. Without `--functional` the script asserts that the one-minute
+system load is below 2 at start and end; `--functional` checks delivery and never
 reports timing. Timing includes generated language conversions and executor wakeup,
 starting immediately before publish and ending at callback entry. Payload setup
 and validation are excluded from the latency interval. Copy counters exclude
-payload setup, warmup and teardown. See the task's phase1 report for complete
-commands, alternating runs, raw counters and load readings.
+payload setup, warmup and teardown.
