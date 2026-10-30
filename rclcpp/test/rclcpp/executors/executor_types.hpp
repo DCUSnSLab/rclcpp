@@ -23,16 +23,8 @@
 #include "rclcpp/executors/events_cbg_executor/events_cbg_executor.hpp"
 #include "rclcpp/experimental/executors/events_executor/events_executor.hpp"
 #include "rclcpp/executors/single_threaded_executor.hpp"
-#include "rclcpp/experimental/executors/rcl_executor.hpp"
 #include "rclcpp/executors/static_single_threaded_executor.hpp"
 #include "rclcpp/executors/multi_threaded_executor.hpp"
-
-class WaitSetRclExecutor : public rclcpp::experimental::executors::RclExecutor
-{
-public:
-  explicit WaitSetRclExecutor(const rclcpp::ExecutorOptions & options = rclcpp::ExecutorOptions())
-  : RclExecutor(options, 1, RCL_EXECUTOR_WAIT_SET) {}
-};
 
 using ExecutorTypes =
   ::testing::Types<
@@ -40,9 +32,7 @@ using ExecutorTypes =
   rclcpp::executors::MultiThreadedExecutor,
   rclcpp::executors::StaticSingleThreadedExecutor,
   rclcpp::executors::EventsCBGExecutor,
-  rclcpp::experimental::executors::EventsExecutor,
-  rclcpp::experimental::executors::RclExecutor,
-  WaitSetRclExecutor>;
+  rclcpp::experimental::executors::EventsExecutor>;
 
 class ExecutorTypeNames
 {
@@ -71,12 +61,6 @@ public:
       return "EventsExecutor";
     }
 
-    if (std::is_same<T, rclcpp::experimental::executors::RclExecutor>()) {
-      return "RclExecutor";
-    }
-
-    if (std::is_same<T, WaitSetRclExecutor>()) {return "WaitSetRclExecutor";}
-
     return "";
   }
 };
@@ -88,8 +72,6 @@ using StandardExecutors =
   rclcpp::executors::SingleThreadedExecutor,
   rclcpp::executors::MultiThreadedExecutor,
   rclcpp::executors::EventsCBGExecutor,
-  rclcpp::experimental::executors::EventsExecutor,
-  rclcpp::experimental::executors::RclExecutor,
-  WaitSetRclExecutor>;
+  rclcpp::experimental::executors::EventsExecutor>;
 
 #endif  // RCLCPP__EXECUTORS__EXECUTOR_TYPES_HPP_

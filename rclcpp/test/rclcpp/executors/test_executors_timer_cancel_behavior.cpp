@@ -289,8 +289,7 @@ using MainExecutorTypes =
   ::testing::Types<
   rclcpp::executors::SingleThreadedExecutor,
   rclcpp::executors::MultiThreadedExecutor,
-  rclcpp::executors::StaticSingleThreadedExecutor,
-  rclcpp::experimental::executors::RclExecutor>;
+  rclcpp::executors::StaticSingleThreadedExecutor>;
 
 // TODO(@fujitatomoya): this test excludes EventExecutor because it does not
 // support simulation time used for this test to relax the racy condition.

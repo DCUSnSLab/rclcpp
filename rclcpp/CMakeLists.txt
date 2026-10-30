@@ -65,6 +65,7 @@ set(${PROJECT_NAME}_SRCS
   src/rclcpp/exceptions/exceptions.cpp
   src/rclcpp/executable_list.cpp
   src/rclcpp/executor.cpp
+  src/rclcpp/executor_core.cpp
   src/rclcpp/executor_options.cpp
   src/rclcpp/executors.cpp
   src/rclcpp/executors/events_cbg_executor/events_cbg_executor.cpp
@@ -78,7 +79,6 @@ set(${PROJECT_NAME}_SRCS
   src/rclcpp/executors/static_single_threaded_executor.cpp
   src/rclcpp/expand_topic_or_service_name.cpp
   src/rclcpp/experimental/executors/events_executor/events_executor.cpp
-  src/rclcpp/experimental/executors/rcl_executor.cpp
   src/rclcpp/experimental/timers_manager.cpp
   src/rclcpp/future_return_code.cpp
   src/rclcpp/generic_client.cpp

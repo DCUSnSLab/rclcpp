@@ -24,7 +24,7 @@ SingleThreadedExecutor::SingleThreadedExecutor(const rclcpp::ExecutorOptions & o
 : rclcpp::Executor(options)
 {
   if (rclcpp::executor_core_requested()) {
-    impl_->core = std::make_unique<rclcpp::ExecutorCore>(*this, 1, RCL_EXECUTOR_WAIT_SET);
+    impl_->core = std::make_unique<rclcpp::ExecutorCore>(*this, 1);
   }
 }
 

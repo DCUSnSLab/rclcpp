@@ -6,18 +6,14 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-#include "rclcpp/experimental/executors/rcl_executor.hpp"
 #include <rcl/wait.h>
 #include <algorithm>
 #include <atomic>
-#include <deque>
 #include <exception>
 #include <functional>
-#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <thread>
 #include <vector>
 
@@ -26,9 +22,8 @@
 #include <rclcpp/event_handler.hpp>
 #include <rclcpp/exceptions.hpp>
 #include <rclcpp/logging.hpp>
-#include <rclcpp/experimental/subscription_intra_process_base.hpp>
 #include <rcpputils/scope_exit.hpp>
-#include "../../executor_implementation.hpp"
+#include "executor_implementation.hpp"
 
 namespace rclcpp
 {
@@ -62,9 +57,6 @@ struct ExecutorCore::Impl
     Clock::SharedPtr clock;
     std::function<bool(const rcl_executor_item_t &)> execute;
     std::function<void()> clear;
-    std::mutex mutex;
-    std::deque<int> events;
-    bool guard_only = false;
     std::function<void(size_t, int)> on_ready;
     std::vector<uint64_t> observers;
   };
@@ -73,37 +65,28 @@ struct ExecutorCore::Impl
   rcl_executor_handle_t * handle = nullptr;
   uint64_t maintenance = 0;
   size_t threads;
-  rcl_executor_selection_policy_t policy;
   std::mutex mutex;
   std::mutex selection_mutex;
   std::unordered_map<const void *, std::shared_ptr<Entity>> entities;
   std::exception_ptr error;
   std::atomic<bool> stopped{false};
   std::atomic<bool> dirty{true};
-  bool partitioned = false;
   bool yield_before_execute = false;
   std::chrono::nanoseconds timeout{-1};
-  ThreadStart thread_start;
   std::unordered_map<uint64_t, CallbackGroup::WeakPtr> known_groups;
   std::vector<uint64_t> collected_busy{UINT64_MAX};
-  std::unordered_map<uint64_t, std::shared_ptr<Entity>> sources;
+  // Registrations of the entities that a native waitable observes.
+  std::unordered_map<uint64_t, std::shared_ptr<Entity>> observed;
 
-  Impl(
-    Executor & executor, size_t count, rcl_executor_selection_policy_t selection,
-    bool partitions = false)
-  : owner(executor), threads(std::max<size_t>(count, 1)), policy(selection), partitioned(partitions)
+  Impl(Executor & executor, size_t count)
+  : owner(executor), threads(std::max<size_t>(count, 1))
   {
-    checked(rcl_executor_create_with_policy(&core, policy));
+    checked(rcl_executor_create(&core));
     checked(rcl_executor_set_trace_client(core, RCL_EXECUTOR_TRACE_RCLCPP));
-    checked(rcl_executor_set_partitioned(core, partitioned));
     handle = rcl_executor_get_handle(core);
-    checked(rcl_executor_add_group(core, partitioned ? 0 : UINT64_MAX,
-        partitioned ? RCL_EXECUTOR_REENTRANT : RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
-    checked(rcl_executor_add(core, RCL_EXECUTOR_WORK, nullptr, nullptr,
-        partitioned ? 0 : UINT64_MAX, &maintenance));
-    if (policy == RCL_EXECUTOR_WAIT_SET) {
-      checked(rcl_executor_set_order(core, maintenance, UINT64_MAX));
-    }
+    checked(rcl_executor_add_group(core, UINT64_MAX, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+    checked(rcl_executor_add(core, RCL_EXECUTOR_WORK, nullptr, nullptr, UINT64_MAX, &maintenance));
+    checked(rcl_executor_set_order(core, maintenance, UINT64_MAX));
     owner.notify_waitable_->set_on_ready_callback([this](size_t, int) {
         dirty = true;
         owner.entities_need_rebuild_ = true;
@@ -129,7 +112,7 @@ struct ExecutorCore::Impl
     checked(rcl_executor_remove(core, entity.id));
     for (auto id : entity.observers) {
       checked(rcl_executor_remove(core, id));
-      sources.erase(id);
+      observed.erase(id);
     }
   }
 
@@ -170,58 +153,35 @@ struct ExecutorCore::Impl
           auto entity = std::make_shared<Entity>();
           entity->object = waitable;
           entity->group = group;
-          bool native_waitable = policy == RCL_EXECUTOR_WAIT_SET &&
-            waitable->get_number_of_ready_timers() > 0;
-          entity->guard_only = !std::dynamic_pointer_cast<
-            rclcpp::experimental::SubscriptionIntraProcessBase>(waitable) &&
-            waitable->get_number_of_ready_guard_conditions() > 0 &&
-            waitable->get_number_of_ready_subscriptions() == 0 &&
-            waitable->get_number_of_ready_timers() == 0 &&
-            waitable->get_number_of_ready_clients() == 0 &&
-            waitable->get_number_of_ready_services() == 0 &&
-            waitable->get_number_of_ready_events() == 0;
+          bool native_waitable = waitable->get_number_of_ready_timers() > 0;
           std::weak_ptr<Entity> weak_entity = entity;
           Waitable::WeakPtr weak_waitable = waitable;
-          checked(rcl_executor_add(core, policy == RCL_EXECUTOR_WAIT_SET ?
-              RCL_EXECUTOR_WAITABLE : RCL_EXECUTOR_WORK, nullptr, waitable.get(),
+          checked(rcl_executor_add(core, RCL_EXECUTOR_WAITABLE, nullptr, waitable.get(),
               group_id, &entity->id));
           entity->execute = [this, weak_entity, weak_waitable, native_waitable](
             const rcl_executor_item_t &) {
               auto e = weak_entity.lock();
               auto work = weak_waitable.lock();
               if (!e || !work) {return false;}
-              int id = 0;
-              if (policy != RCL_EXECUTOR_WAIT_SET) {
-                std::lock_guard<std::mutex> guard(e->mutex);
-                id = e->events.front();
-                e->events.pop_front();
+              auto ws = rcl_get_zero_initialized_wait_set();
+              checked(rcl_wait_set_init(&ws,
+                  work->get_number_of_ready_subscriptions(),
+                  work->get_number_of_ready_guard_conditions(),
+                  work->get_number_of_ready_timers(), work->get_number_of_ready_clients(),
+                  work->get_number_of_ready_services(), work->get_number_of_ready_events(),
+                  owner.context_->get_rcl_context().get(), rcl_get_default_allocator()));
+              RCPPUTILS_SCOPE_EXIT(checked(rcl_wait_set_fini(&ws)););
+              work->add_to_wait_set(ws);
+              auto result = rcl_wait(&ws, 0);
+              if (result != RCL_RET_TIMEOUT) {checked(result);}
+              if (!work->is_ready(ws)) {return false;}
+              RCPPUTILS_SCOPE_EXIT(
+                if (!native_waitable && !std::dynamic_pointer_cast<EventHandlerBase>(work)) {
+              checked(rcl_executor_notify(core, e->id, 1));
               }
-              std::shared_ptr<void> data;
-              if (policy == RCL_EXECUTOR_WAIT_SET) {
-                auto ws = rcl_get_zero_initialized_wait_set();
-                checked(rcl_wait_set_init(&ws,
-                    work->get_number_of_ready_subscriptions(),
-                    work->get_number_of_ready_guard_conditions(),
-                    work->get_number_of_ready_timers(), work->get_number_of_ready_clients(),
-                    work->get_number_of_ready_services(), work->get_number_of_ready_events(),
-                    owner.context_->get_rcl_context().get(), rcl_get_default_allocator()));
-                RCPPUTILS_SCOPE_EXIT(checked(rcl_wait_set_fini(&ws)););
-                work->add_to_wait_set(ws);
-                auto result = rcl_wait(&ws, 0);
-                if (result != RCL_RET_TIMEOUT) {checked(result);}
-                if (!work->is_ready(ws)) {return false;}
-                RCPPUTILS_SCOPE_EXIT(
-                  if (!native_waitable && !std::dynamic_pointer_cast<EventHandlerBase>(work)) {
-                checked(rcl_executor_notify(core, e->id, 1));
-                  }
-                );
-                const auto ready_data = work->take_data();
-                work->execute(ready_data);
-                return true;
-              } else {
-                data = work->take_data_by_entity_id(static_cast<size_t>(id));
-              }
-              work->execute(static_cast<const std::shared_ptr<void> &>(data));
+              );
+              const auto ready_data = work->take_data();
+              work->execute(ready_data);
               return true;
             };
           entities.emplace(waitable.get(), entity);
@@ -244,7 +204,7 @@ struct ExecutorCore::Impl
                   uint64_t id;
                   checked(rcl_executor_add(core, type, handles[i], waitable.get(), group_id, &id));
                   entity->observers.push_back(id);
-                  sources.emplace(id, entity);
+                  observed.emplace(id, entity);
                 }
               };
             observe(ws.timers, ws.size_of_timers, RCL_EXECUTOR_TIMER_OBSERVER);
@@ -255,25 +215,10 @@ struct ExecutorCore::Impl
             observe(ws.events, ws.size_of_events, RCL_EXECUTOR_EVENT);
             return;
           }
-          entity->on_ready = [this, weak_entity](size_t count, int id) {
+          entity->on_ready = [this, weak_entity](size_t, int) {
               auto e = weak_entity.lock();
               if (!e) {return;}
-              if (policy == RCL_EXECUTOR_WAIT_SET) {
-                checked(rcl_executor_notify(core, e->id, 1));
-                return;
-              }
-              size_t credits = count;
-              {
-                std::lock_guard<std::mutex> guard(e->mutex);
-                if (e->guard_only) {
-                  if (std::find(e->events.begin(), e->events.end(), id) != e->events.end()) {
-                    return;
-                  }
-                  credits = 1;
-                }
-                for (size_t i = 0; i < credits; ++i) {e->events.push_back(id);}
-              }
-              checked(rcl_executor_notify(core, e->id, credits));
+              checked(rcl_executor_notify(core, e->id, 1));
             };
           // A QoS event goes to the rcl executor callback, so a callback the user set on it stays.
           if (std::dynamic_pointer_cast<EventHandlerBase>(waitable)) {
@@ -299,9 +244,7 @@ struct ExecutorCore::Impl
                 if (auto work = weak_waitable.lock()) {work->clear_on_ready_callback();}
               };
           }
-          if (policy == RCL_EXECUTOR_WAIT_SET) {
-            checked(rcl_executor_notify(core, entity->id, 1));
-          }
+          checked(rcl_executor_notify(core, entity->id, 1));
         };
       group->collect_all_ptrs(
         [&](const SubscriptionBase::SharedPtr & sub) {
@@ -367,38 +310,36 @@ struct ExecutorCore::Impl
 
   void reorder(bool changed)
   {
-    if (policy == RCL_EXECUTOR_WAIT_SET) {
-      std::lock_guard<std::mutex> owner_lock(owner.mutex_);
-      // A rebuild changes slots only if entities or the groups it leaves out changed.
-      if (owner.entities_need_rebuild_.exchange(false) || owner.current_collection_.empty()) {
-        auto busy = busy_groups();
-        if (changed || busy != collected_busy || owner.current_collection_.empty()) {
-          owner.collect_entities();
-          changed = true;
-          collected_busy = busy_groups() == busy ? busy : std::vector<uint64_t>{UINT64_MAX};
-        }
+    std::lock_guard<std::mutex> owner_lock(owner.mutex_);
+    // A rebuild changes slots only if entities or the groups it leaves out changed.
+    if (owner.entities_need_rebuild_.exchange(false) || owner.current_collection_.empty()) {
+      auto busy = busy_groups();
+      if (changed || busy != collected_busy || owner.current_collection_.empty()) {
+        owner.collect_entities();
+        changed = true;
+        collected_busy = busy_groups() == busy ? busy : std::vector<uint64_t>{UINT64_MAX};
       }
-      if (!changed) {return;}
-      auto order = [&](size_t count, auto get) {
-          for (size_t i = 0; i < count; ++i) {
-            auto pointer = get(i);
-            auto found = entities.find(pointer.get());
-            if (found != entities.end() && found->second->order != i) {
-              checked(rcl_executor_set_order(core, found->second->id, i));
-              for (auto id : found->second->observers) {
-                checked(rcl_executor_set_order(core, id, i));
-              }
-              found->second->order = i;
-            }
-          }
-        };
-      auto & slots = owner.wait_set_;
-      order(slots.size_of_timers(), [&](size_t i) {return slots.timers(i);});
-      order(slots.size_of_subscriptions(), [&](size_t i) {return slots.subscriptions(i);});
-      order(slots.size_of_services(), [&](size_t i) {return slots.services(i);});
-      order(slots.size_of_clients(), [&](size_t i) {return slots.clients(i);});
-      order(slots.size_of_waitables(), [&](size_t i) {return slots.waitables(i);});
     }
+    if (!changed) {return;}
+    auto order = [&](size_t count, auto get) {
+        for (size_t i = 0; i < count; ++i) {
+          auto pointer = get(i);
+          auto found = entities.find(pointer.get());
+          if (found != entities.end() && found->second->order != i) {
+            checked(rcl_executor_set_order(core, found->second->id, i));
+            for (auto id : found->second->observers) {
+              checked(rcl_executor_set_order(core, id, i));
+            }
+            found->second->order = i;
+          }
+        }
+      };
+    auto & slots = owner.wait_set_;
+    order(slots.size_of_timers(), [&](size_t i) {return slots.timers(i);});
+    order(slots.size_of_subscriptions(), [&](size_t i) {return slots.subscriptions(i);});
+    order(slots.size_of_services(), [&](size_t i) {return slots.services(i);});
+    order(slots.size_of_clients(), [&](size_t i) {return slots.clients(i);});
+    order(slots.size_of_waitables(), [&](size_t i) {return slots.waitables(i);});
   }
 
   std::vector<uint64_t> busy_groups() const
@@ -441,8 +382,8 @@ struct ExecutorCore::Impl
       if (found != entities.end() && found->second->id == item.registration) {
         entity = found->second;
       } else {
-        auto source = sources.find(item.registration);
-        if (source == sources.end()) {return false;}
+        auto source = observed.find(item.registration);
+        if (source == observed.end()) {return false;}
         entity = source->second;
       }
     }
@@ -453,7 +394,7 @@ struct ExecutorCore::Impl
     RCPPUTILS_SCOPE_EXIT(
       if (exclusive) {
         group->can_be_taken_from() = true;
-        if (policy == RCL_EXECUTOR_WAIT_SET) {owner.entities_need_rebuild_ = true;}
+        owner.entities_need_rebuild_ = true;
       }
     );
     return entity->execute(item);
@@ -461,9 +402,8 @@ struct ExecutorCore::Impl
 
   void spin_wait_set()
   {
-    auto run = [this](size_t index) {
+    auto run = [this]() {
         try {
-          start_thread(index, 0, this);
           while (owner.spinning && rclcpp::ok(owner.context_)) {
             rcl_executor_item_t item;
             {
@@ -504,32 +444,14 @@ struct ExecutorCore::Impl
       };
     std::vector<std::thread> workers;
     try {
-      for (size_t i = 1; i < threads; ++i) {workers.emplace_back(run, i);}
+      for (size_t i = 1; i < threads; ++i) {workers.emplace_back(run);}
     } catch (...) {
       rcl_executor_stop(handle);
       for (auto & worker : workers) {worker.join();}
       throw;
     }
-    run(0);
+    run();
     for (auto & worker : workers) {worker.join();}
-  }
-
-  static void start_thread(size_t index, uint64_t id, void * data) noexcept
-  {
-    auto self = static_cast<Impl *>(data);
-    try {
-      CallbackGroup::SharedPtr group;
-      {
-        std::lock_guard<std::mutex> lock(self->mutex);
-        auto found = self->known_groups.find(id);
-        if (found != self->known_groups.end()) {group = found->second.lock();}
-      }
-      if (self->thread_start) {self->thread_start(index, group);}
-    } catch (...) {
-      std::lock_guard<std::mutex> lock(self->mutex);
-      if (!self->error) {self->error = std::current_exception();}
-      rcl_executor_stop(self->handle);
-    }
   }
 
   static void dispatch(const rcl_executor_item_t * item, void * data) noexcept
@@ -545,52 +467,14 @@ struct ExecutorCore::Impl
   }
 };
 
-ExecutorCore::ExecutorCore(
-  Executor & owner, size_t threads, rcl_executor_selection_policy_t policy, bool partitioned)
-: impl_(std::make_unique<Impl>(owner, threads, policy, partitioned)) {}
+ExecutorCore::ExecutorCore(Executor & owner, size_t threads)
+: impl_(std::make_unique<Impl>(owner, threads)) {}
 ExecutorCore::~ExecutorCore() = default;
 void ExecutorCore::sync() {impl_->sync();}
 void ExecutorCore::configure(bool yield_before_execute, std::chrono::nanoseconds timeout)
 {
   impl_->yield_before_execute = yield_before_execute;
   impl_->timeout = timeout;
-}
-void ExecutorCore::on_thread_start(ThreadStart callback)
-{
-  if (impl_->owner.spinning) {throw std::logic_error("executor is spinning");}
-  impl_->thread_start = std::move(callback);
-  checked(rcl_executor_set_thread_start(impl_->core, Impl::start_thread, impl_.get()));
-}
-rcl_executor_id_t ExecutorCore::add_source(
-  CallbackGroup::SharedPtr group, std::function<void()> dispatch)
-{
-  impl_->sync();
-  auto entity = std::make_shared<Impl::Entity>();
-  entity->group = group;
-  entity->execute = [dispatch = std::move(dispatch)](const rcl_executor_item_t &) {
-      dispatch(); return true;
-    };
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  checked(rcl_executor_add(impl_->core, RCL_EXECUTOR_WORK, nullptr, entity.get(),
-      reinterpret_cast<uintptr_t>(group.get()), &entity->id));
-  impl_->sources.emplace(entity->id, entity);
-  return entity->id;
-}
-void ExecutorCore::notify_source(rcl_executor_id_t source, size_t count)
-{
-  checked(rcl_executor_notify(impl_->core, source, count));
-}
-void ExecutorCore::remove_source(rcl_executor_id_t source)
-{
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  checked(rcl_executor_remove(impl_->core, source));
-  impl_->sources.erase(source);
-}
-void ExecutorCore::set_group_priority(CallbackGroup::SharedPtr group, int32_t priority)
-{
-  impl_->sync();
-  checked(rcl_executor_set_group_priority(
-      impl_->core, reinterpret_cast<uintptr_t>(group.get()), priority));
 }
 void ExecutorCore::cancel()
 {
@@ -605,21 +489,14 @@ void ExecutorCore::spin()
   }
   RCPPUTILS_SCOPE_EXIT(impl_->owner.spinning = false; rcl_executor_reset(impl_->core););
   rcl_executor_reset(impl_->core);
-  if (impl_->policy == RCL_EXECUTOR_WAIT_SET) {impl_->owner.entities_need_rebuild_ = true;}
+  impl_->owner.entities_need_rebuild_ = true;
   impl_->sync();
   impl_->error = nullptr;
-  auto result = RCL_RET_OK;
-  if (impl_->policy == RCL_EXECUTOR_WAIT_SET && !impl_->partitioned) {
-    impl_->spin_wait_set();
-  } else {
-    result = rcl_executor_spin(impl_->core, impl_->threads, Impl::dispatch, impl_.get());
-  }
+  impl_->spin_wait_set();
   if (impl_->error) {std::rethrow_exception(impl_->error);}
-  checked(result);
 }
 void ExecutorCore::spin_once(std::chrono::nanoseconds timeout)
 {
-  if (impl_->partitioned) {throw std::logic_error("partition mode requires spin()");}
   // The round survives between calls like Executor::wait_result_; Executor ends it.
   if (impl_->stopped.exchange(false)) {rcl_executor_reset(impl_->core);}
   auto start = std::chrono::steady_clock::now();
@@ -651,7 +528,6 @@ void ExecutorCore::spin_once(std::chrono::nanoseconds timeout)
 void ExecutorCore::end_round() {rcl_executor_reset(impl_->core);}
 void ExecutorCore::drain(std::chrono::nanoseconds duration, bool exhaustive)
 {
-  if (impl_->partitioned) {throw std::logic_error("partition mode requires spin()");}
   if (impl_->owner.spinning.exchange(true)) {
     throw std::runtime_error("executor is already spinning");
   }
@@ -665,7 +541,6 @@ void ExecutorCore::drain(std::chrono::nanoseconds duration, bool exhaustive)
     auto status = exhaustive ? rcl_executor_next(impl_->core, &item) :
       rcl_executor_next_excluding(impl_->core, &item, visited.data(), visited.size());
     if (status == RCL_EXECUTOR_TIMEOUT && exhaustive &&
-      impl_->policy == RCL_EXECUTOR_WAIT_SET &&
       rcl_executor_wait(impl_->core, 0) == RCL_EXECUTOR_READY)
     {
       impl_->refresh(false);
@@ -678,97 +553,4 @@ void ExecutorCore::drain(std::chrono::nanoseconds duration, bool exhaustive)
     if (duration.count() > 0 && std::chrono::steady_clock::now() - start >= duration) {break;}
   }
 }
-namespace experimental::executors
-{
-struct RclExecutor::Impl
-{
-  ExecutorCore core;
-  bool partitioned;
-  Impl(
-    Executor & owner, size_t count, rcl_executor_selection_policy_t policy,
-    bool partitions = false)
-  : core(owner, count, policy, partitions), partitioned(partitions) {}
-};
-
-RclExecutor::RclExecutor(const ExecutorOptions & options, size_t threads)
-: RclExecutor(options, threads, RCL_EXECUTOR_FIFO) {}
-RclExecutor::RclExecutor(
-  const ExecutorOptions & options, size_t threads, rcl_executor_selection_policy_t selection_policy)
-: Executor(options), impl_(std::make_unique<Impl>(*this, threads, selection_policy)) {}
-RclExecutor::RclExecutor(
-  const ExecutorOptions & options, Mode mode, rcl_executor_selection_policy_t policy)
-: Executor(options), impl_(std::make_unique<Impl>(*this, 1, policy, mode == Mode::Partitioned)) {}
-void RclExecutor::on_thread_start(ThreadStart callback)
-{
-  impl_->core.on_thread_start(std::move(callback));
-}
-rcl_executor_id_t RclExecutor::add_source(
-  CallbackGroup::SharedPtr group, std::function<void()> dispatch)
-{
-  return impl_->core.add_source(group, std::move(dispatch));
-}
-void RclExecutor::notify_source(rcl_executor_id_t source, size_t count)
-{
-  impl_->core.notify_source(source, count);
-}
-void RclExecutor::remove_source(rcl_executor_id_t source)
-{
-  impl_->core.remove_source(source);
-}
-void RclExecutor::set_group_priority(CallbackGroup::SharedPtr group, int32_t priority)
-{
-  impl_->core.set_group_priority(group, priority);
-}
-RclExecutor::~RclExecutor() = default;
-void RclExecutor::add_node(node_interfaces::NodeBaseInterface::SharedPtr node, bool notify)
-{
-  if (impl_->partitioned) {
-    node->for_each_callback_group([](const CallbackGroup::SharedPtr & group) {
-        if (group->automatically_add_to_executor_with_node() &&
-        group->type() == CallbackGroupType::Reentrant)
-        {
-          throw std::invalid_argument("partition mode refuses Reentrant callback groups");
-        }
-      });
-  }
-  Executor::add_node(node, notify);
-  impl_->core.sync();
-}
-void RclExecutor::remove_node(node_interfaces::NodeBaseInterface::SharedPtr node, bool notify)
-{
-  Executor::remove_node(node, notify);
-  impl_->core.sync();
-}
-void RclExecutor::add_callback_group(
-  CallbackGroup::SharedPtr group, node_interfaces::NodeBaseInterface::SharedPtr node, bool notify)
-{
-  if (impl_->partitioned && group->type() == CallbackGroupType::Reentrant) {
-    throw std::invalid_argument("partition mode refuses Reentrant callback groups");
-  }
-  Executor::add_callback_group(group, node, notify);
-  impl_->core.sync();
-}
-void RclExecutor::remove_callback_group(CallbackGroup::SharedPtr group, bool notify)
-{
-  Executor::remove_callback_group(group, notify);
-  impl_->core.sync();
-}
-void RclExecutor::cancel() {impl_->core.cancel();}
-void RclExecutor::spin() {impl_->core.spin();}
-void RclExecutor::spin_once_impl(std::chrono::nanoseconds timeout)
-{
-  RCPPUTILS_SCOPE_EXIT(impl_->core.end_round(););
-  impl_->core.spin_once(timeout);
-}
-void RclExecutor::drain(std::chrono::nanoseconds duration, bool exhaustive)
-{
-  impl_->core.drain(duration, exhaustive);
-}
-void RclExecutor::spin_some(std::chrono::nanoseconds duration) {drain(duration, false);}
-void RclExecutor::spin_all(std::chrono::nanoseconds duration)
-{
-  if (duration.count() <= 0) {throw std::invalid_argument("spin_all duration must be positive");}
-  drain(duration, true);
-}
-}  // namespace experimental::executors
 }  // namespace rclcpp

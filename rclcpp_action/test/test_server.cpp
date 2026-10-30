@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -24,7 +25,6 @@
 #include "gtest/gtest.h"
 
 #include "rclcpp/exceptions.hpp"
-#include "rclcpp/experimental/executors/rcl_executor.hpp"
 #include "rclcpp/node.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rcpputils/scope_exit.hpp"
@@ -1574,8 +1574,16 @@ TEST(WaitSetAction, result_expires_after_dispatch)
         [](auto goal) {goal->succeed(std::make_shared<Action::Result>());}, options);
     auto client = rclcpp_action::create_client<Action>(node, "expiry");
     ASSERT_TRUE(client->wait_for_action_server(2s));
-    rclcpp::experimental::executors::RclExecutor executor(
-      rclcpp::ExecutorOptions(), 1, RCL_EXECUTOR_WAIT_SET);
+    // The rcl_executor core claims the expiry timer before it dispatches it.
+    const char * previous = std::getenv("ROS_EXECUTOR_CORE");
+    const std::string saved = previous ? previous : "";
+    setenv("ROS_EXECUTOR_CORE", "1", 1);
+    rclcpp::executors::SingleThreadedExecutor executor;
+    if (previous) {
+      setenv("ROS_EXECUTOR_CORE", saved.c_str(), 1);
+    } else {
+      unsetenv("ROS_EXECUTOR_CORE");
+    }
     executor.add_node(node);
     auto sent = client->async_send_goal(Action::Goal());
     ASSERT_EQ(rclcpp::FutureReturnCode::SUCCESS, executor.spin_until_future_complete(sent, 2s));

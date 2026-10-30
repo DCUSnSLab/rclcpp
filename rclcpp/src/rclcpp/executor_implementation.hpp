@@ -9,21 +9,19 @@
 #ifndef RCLCPP__EXECUTOR_IMPLEMENTATION_HPP_
 #define RCLCPP__EXECUTOR_IMPLEMENTATION_HPP_
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 
-#include "rclcpp/experimental/executors/rcl_executor.hpp"
+#include "rclcpp/executor.hpp"
 
 namespace rclcpp
 {
 class ExecutorCore
 {
 public:
-  using ThreadStart = experimental::executors::RclExecutor::ThreadStart;
-  ExecutorCore(
-    Executor & owner, size_t threads, rcl_executor_selection_policy_t policy,
-    bool partitioned = false);
+  ExecutorCore(Executor & owner, size_t threads);
   ~ExecutorCore();
   void sync();
   void spin();
@@ -31,11 +29,6 @@ public:
   void spin_once(std::chrono::nanoseconds timeout);
   void end_round();
   void drain(std::chrono::nanoseconds duration, bool exhaustive);
-  void on_thread_start(ThreadStart callback);
-  void set_group_priority(CallbackGroup::SharedPtr group, int32_t priority);
-  rcl_executor_id_t add_source(CallbackGroup::SharedPtr group, std::function<void()> dispatch);
-  void notify_source(rcl_executor_id_t source, size_t count);
-  void remove_source(rcl_executor_id_t source);
   void configure(bool yield_before_execute, std::chrono::nanoseconds timeout);
 
 private:

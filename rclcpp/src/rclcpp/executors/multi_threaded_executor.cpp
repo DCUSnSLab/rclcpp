@@ -41,8 +41,7 @@ MultiThreadedExecutor::MultiThreadedExecutor(
     std::max(std::thread::hardware_concurrency(), 2U);
 
   if (rclcpp::executor_core_requested()) {
-    impl_->core = std::make_unique<rclcpp::ExecutorCore>(*this, number_of_threads_,
-      RCL_EXECUTOR_WAIT_SET);
+    impl_->core = std::make_unique<rclcpp::ExecutorCore>(*this, number_of_threads_);
     impl_->core->configure(yield_before_execute_, next_exec_timeout_);
   }
 
