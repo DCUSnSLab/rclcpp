@@ -23,9 +23,6 @@
 #include <utility>
 #include <vector>
 
-#include "rcl/intra_process.h"
-#include "rclcpp/detail/ipc_adapted.hpp"
-
 #include "rcl/allocator.h"
 #include "rcl/error_handling.h"
 #include "rclcpp/executors/executor_notify_waitable.hpp"
@@ -614,30 +611,6 @@ Executor::execute_subscription(rclcpp::SubscriptionBase::SharedPtr subscription)
         } else {
           // This case is taking a copy of the message data from the middleware via
           // inter-process communication.
-          rcl_ipc_message_t * owned = nullptr;
-          const void * data = nullptr;
-          const void * adapted = nullptr;
-          auto handle = subscription->get_subscription_handle().get();
-          auto adapted_take = rclcpp::detail::get_ipc_adapted_take(handle);
-          if (adapted_take && adapted_take->owner != subscription.get()) {
-            adapted_take.reset();
-          }
-          if ((adapted_take ?
-            rcl_take_ipc_adapted(handle, adapted_take->key.c_str(), &owned, &adapted, &data,
-            &message_info.get_rmw_message_info()) :
-            rcl_take_ipc_message(handle, &owned, &data, &message_info.get_rmw_message_info())) ==
-            RCL_RET_OK)
-          {
-            std::shared_ptr<void> message(const_cast<void *>(data), [owned](void *) {
-                rcl_ipc_message_release(owned);
-              });
-            if (adapted) {
-              adapted_take->handle(adapted, message, message_info);
-            } else {
-              subscription->handle_message(message, message_info);
-            }
-            break;
-          }
           std::shared_ptr<void> message = subscription->create_message();
           take_and_do_error_handling(
             "taking a message from topic",
@@ -697,18 +670,11 @@ void
 Executor::execute_service(rclcpp::ServiceBase::SharedPtr service)
 {
   auto request_header = service->create_request_header();
-  std::shared_ptr<void> request;
+  std::shared_ptr<void> request = service->create_request();
   take_and_do_error_handling(
     "taking a service server request from service",
     service->get_service_name(),
-    [&]() {
-      request = service->take_ipc_request(*request_header);
-      if (request) {
-        return true;
-      }
-      request = service->create_request();
-      return service->take_type_erased_request(request.get(), *request_header);
-    },
+    [&]() {return service->take_type_erased_request(request.get(), *request_header);},
     [&]() {service->handle_request(request_header, request);});
 }
 
@@ -716,18 +682,11 @@ void
 Executor::execute_client(rclcpp::ClientBase::SharedPtr client)
 {
   auto request_header = client->create_request_header();
-  std::shared_ptr<void> response;
+  std::shared_ptr<void> response = client->create_response();
   take_and_do_error_handling(
     "taking a service client response from service",
     client->get_service_name(),
-    [&]() {
-      response = client->take_ipc_response(*request_header);
-      if (response) {
-        return true;
-      }
-      response = client->create_response();
-      return client->take_type_erased_response(response.get(), *request_header);
-    },
+    [&]() {return client->take_type_erased_response(response.get(), *request_header);},
     [&]() {client->handle_response(request_header, response);});
 }
 

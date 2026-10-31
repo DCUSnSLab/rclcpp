@@ -46,6 +46,41 @@ struct rclcpp::TypeAdapter<MyEmpty, test_msgs::msg::Empty>
 
 using MyTA = rclcpp::TypeAdapter<MyEmpty, test_msgs::msg::Empty>;
 
+// Type adapter that references the received message instead of copying it.
+struct SharedEmpty
+{
+  std::shared_ptr<const test_msgs::msg::Empty> message;
+};
+
+template<>
+struct rclcpp::TypeAdapter<SharedEmpty, test_msgs::msg::Empty>
+{
+  using is_specialized = std::true_type;
+  using custom_type = SharedEmpty;
+  using ros_message_type = test_msgs::msg::Empty;
+
+  static
+  void
+  convert_to_ros_message(const custom_type &, ros_message_type &)
+  {}
+
+  static
+  void
+  convert_to_custom(const ros_message_type & source, custom_type & destination)
+  {
+    destination.message = std::make_shared<ros_message_type>(source);
+  }
+
+  static
+  std::shared_ptr<const custom_type>
+  convert_to_custom(std::shared_ptr<const ros_message_type> source)
+  {
+    return std::make_shared<custom_type>(custom_type{std::move(source)});
+  }
+};
+
+using SharedTA = rclcpp::TypeAdapter<SharedEmpty, test_msgs::msg::Empty>;
+
 class TestAnySubscriptionCallback : public ::testing::Test
 {
 public:
@@ -81,6 +116,32 @@ protected:
   std::shared_ptr<MyEmpty> msg_shared_ptr_{std::make_shared<MyEmpty>()};
   rclcpp::MessageInfo message_info_;
 };
+
+TEST(TestAnySubscriptionCallbackSharedTA, const_callbacks_reference_the_ros_message) {
+  auto message = std::make_shared<test_msgs::msg::Empty>();
+  const test_msgs::msg::Empty * received = nullptr;
+  {
+    rclcpp::AnySubscriptionCallback<SharedTA> asc;
+    asc.set([&](std::shared_ptr<const SharedEmpty> e) {received = e->message.get();});
+    asc.dispatch(message, rclcpp::MessageInfo{});
+    EXPECT_EQ(message.get(), received);
+  }
+  {
+    received = nullptr;
+    rclcpp::AnySubscriptionCallback<SharedTA> asc;
+    asc.set([&](const SharedEmpty & e) {received = e.message.get();});
+    asc.dispatch(message, rclcpp::MessageInfo{});
+    EXPECT_EQ(message.get(), received);
+  }
+  {
+    received = nullptr;
+    rclcpp::AnySubscriptionCallback<SharedTA> asc;
+    asc.set([&](std::unique_ptr<SharedEmpty> e) {received = e->message.get();});
+    asc.dispatch(message, rclcpp::MessageInfo{});
+    EXPECT_NE(nullptr, received);
+    EXPECT_NE(message.get(), received);
+  }
+}
 
 TEST_F(TestAnySubscriptionCallback, construct_destruct) {
   // Default constructor.

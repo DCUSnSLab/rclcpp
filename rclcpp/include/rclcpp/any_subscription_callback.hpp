@@ -963,15 +963,6 @@ public:
       std::holds_alternative<ConstRefSharedConstPtrWithInfoCallback>(callback_variant_);
   }
 
-  /// True if dispatch passes the received ROS message itself as a mutable shared pointer.
-  bool
-  receives_mutable_shared_ros_message() const
-  {
-    return
-      std::holds_alternative<SharedPtrROSMessageCallback>(callback_variant_) ||
-      std::holds_alternative<SharedPtrWithInfoROSMessageCallback>(callback_variant_);
-  }
-
   constexpr
   bool
   is_serialized_message_callback() const

@@ -173,14 +173,7 @@ public:
       return nullptr;
     }
     // auto response = allocate_shared<typename ServiceT::Response, Allocator>();
-    std::shared_ptr<typename ServiceT::Response> response;
-    if (service_handle) {
-      response = std::static_pointer_cast<typename ServiceT::Response>(
-        service_handle->borrow_ipc_response(*request_header));
-    }
-    if (!response) {
-      response = std::make_shared<typename ServiceT::Response>();
-    }
+    auto response = std::make_shared<typename ServiceT::Response>();
     if (std::holds_alternative<SharedPtrCallback>(callback_)) {
       (void)request_header;
       const auto & cb = std::get<SharedPtrCallback>(callback_);
