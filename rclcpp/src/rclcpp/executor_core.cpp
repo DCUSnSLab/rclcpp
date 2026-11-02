@@ -34,12 +34,20 @@ void checked(rcl_ret_t result)
   if (result != RCL_RET_OK) {rclcpp::exceptions::throw_from_rcl_error(result);}
 }
 
+// For cleanup and notifier paths, where a throw would end the process or reach other code.
+void logged(rcl_ret_t result, const char * call)
+{
+  if (result == RCL_RET_OK) {return;}
+  RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "%s failed: %s", call, rcl_get_error_string().str);
+  rcl_reset_error();
+}
+
 // The rcl event the handler adds to a wait set; the handler keeps it for its lifetime.
 const rcl_event_t * event_of(Waitable & handler, rcl_context_t * context)
 {
   auto ws = rcl_get_zero_initialized_wait_set();
   checked(rcl_wait_set_init(&ws, 0, 0, 0, 0, 0, 1, context, rcl_get_default_allocator()));
-  RCPPUTILS_SCOPE_EXIT(checked(rcl_wait_set_fini(&ws)););
+  RCPPUTILS_SCOPE_EXIT(logged(rcl_wait_set_fini(&ws), "rcl_wait_set_fini"););
   handler.add_to_wait_set(ws);
   return ws.events[0];
 }
@@ -109,9 +117,10 @@ struct ExecutorCore::Impl
   {
     std::unique_lock<std::mutex> clock_guard;
     if (entity.clock) {clock_guard = std::unique_lock<std::mutex>(entity.clock->get_clock_mutex());}
-    checked(rcl_executor_remove(core, entity.id));
+    // Also called from the destructor, so failures are logged.
+    logged(rcl_executor_remove(core, entity.id), "rcl_executor_remove");
     for (auto id : entity.observers) {
-      checked(rcl_executor_remove(core, id));
+      logged(rcl_executor_remove(core, id), "rcl_executor_remove");
       observed.erase(id);
     }
   }
@@ -170,14 +179,14 @@ struct ExecutorCore::Impl
                   work->get_number_of_ready_timers(), work->get_number_of_ready_clients(),
                   work->get_number_of_ready_services(), work->get_number_of_ready_events(),
                   owner.context_->get_rcl_context().get(), rcl_get_default_allocator()));
-              RCPPUTILS_SCOPE_EXIT(checked(rcl_wait_set_fini(&ws)););
+              RCPPUTILS_SCOPE_EXIT(logged(rcl_wait_set_fini(&ws), "rcl_wait_set_fini"););
               work->add_to_wait_set(ws);
               auto result = rcl_wait(&ws, 0);
               if (result != RCL_RET_TIMEOUT) {checked(result);}
               if (!work->is_ready(ws)) {return false;}
               RCPPUTILS_SCOPE_EXIT(
                 if (!native_waitable && !std::dynamic_pointer_cast<EventHandlerBase>(work)) {
-              checked(rcl_executor_notify(core, e->id, 1));
+              logged(rcl_executor_notify(core, e->id, 1), "rcl_executor_notify");
               }
               );
               const auto ready_data = work->take_data();
@@ -196,7 +205,7 @@ struct ExecutorCore::Impl
                 waitable->get_number_of_ready_timers(), waitable->get_number_of_ready_clients(),
                 waitable->get_number_of_ready_services(), waitable->get_number_of_ready_events(),
                 owner.context_->get_rcl_context().get(), rcl_get_default_allocator()));
-            RCPPUTILS_SCOPE_EXIT(checked(rcl_wait_set_fini(&ws)););
+            RCPPUTILS_SCOPE_EXIT(logged(rcl_wait_set_fini(&ws), "rcl_wait_set_fini"););
             waitable->add_to_wait_set(ws);
             auto observe = [&](auto handles, size_t count, rcl_executor_entity_type_t type) {
                 for (size_t i = 0; i < count; ++i) {
@@ -218,7 +227,7 @@ struct ExecutorCore::Impl
           entity->on_ready = [this, weak_entity](size_t, int) {
               auto e = weak_entity.lock();
               if (!e) {return;}
-              checked(rcl_executor_notify(core, e->id, 1));
+              logged(rcl_executor_notify(core, e->id, 1), "rcl_executor_notify");
             };
           // A QoS event goes to the rcl executor callback, so a callback the user set on it stays.
           if (std::dynamic_pointer_cast<EventHandlerBase>(waitable)) {
@@ -229,6 +238,8 @@ struct ExecutorCore::Impl
                   (*static_cast<const std::function<void(size_t, int)> *>(data))(count, 0);
                 } catch (const std::exception & error) {
                   RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "executor event: %s", error.what());
+                } catch (...) {
+                  RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "executor event: unknown exception");
                 }
               }, &entity->on_ready));
             entity->clear = [weak_waitable, event] {
@@ -400,6 +411,21 @@ struct ExecutorCore::Impl
     return entity->execute(item);
   }
 
+  // Executes a claimed item and releases it. A failed release is thrown here, not from a
+  // destructor; while an exception from the item is already leaving, it is only logged.
+  bool run_claimed(const rcl_executor_item_t & item)
+  {
+    bool executed;
+    try {
+      executed = execute(item);
+    } catch (...) {
+      logged(rcl_executor_complete(core, item.token), "rcl_executor_complete");
+      throw;
+    }
+    checked(rcl_executor_complete(core, item.token));
+    return executed;
+  }
+
   void spin_wait_set()
   {
     auto run = [this]() {
@@ -505,8 +531,7 @@ void ExecutorCore::spin_once(std::chrono::nanoseconds timeout)
     rcl_executor_item_t item;
     auto status = rcl_executor_next(impl_->core, &item);
     if (status == RCL_EXECUTOR_READY) {
-      RCPPUTILS_SCOPE_EXIT(checked(rcl_executor_complete(impl_->core, item.token)););
-      if (impl_->execute(item)) {return;}
+      if (impl_->run_claimed(item)) {return;}
       continue;
     }
     if (status == RCL_EXECUTOR_ERROR) {rclcpp::exceptions::throw_from_rcl_error(RCL_RET_ERROR);}
@@ -547,9 +572,8 @@ void ExecutorCore::drain(std::chrono::nanoseconds duration, bool exhaustive)
       continue;
     }
     if (status != RCL_EXECUTOR_READY) {break;}
-    RCPPUTILS_SCOPE_EXIT(checked(rcl_executor_complete(impl_->core, item.token)););
     if (!exhaustive) {visited.push_back(item.registration);}
-    impl_->execute(item);
+    impl_->run_claimed(item);
     if (duration.count() > 0 && std::chrono::steady_clock::now() - start >= duration) {break;}
   }
 }
