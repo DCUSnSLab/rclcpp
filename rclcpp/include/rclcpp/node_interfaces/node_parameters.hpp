@@ -20,7 +20,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "rcutils/macros.h"
@@ -132,18 +131,6 @@ public:
     const rcl_interfaces::msg::ParameterDescriptor & parameter_descriptor =
     rcl_interfaces::msg::ParameterDescriptor(),
     bool ignore_override = false) override;
-
-  /// Declare several parameters as one change, all or none, with one parameter event.
-  /**
-   * \sa rclcpp::Node::declare_parameters_atomically
-   */
-  RCLCPP_PUBLIC
-  std::vector<rclcpp::ParameterValue>
-  declare_parameters_atomically(
-    const std::string & namespace_,
-    const std::vector<std::pair<rclcpp::Parameter, rcl_interfaces::msg::ParameterDescriptor>> &
-    parameters,
-    bool ignore_overrides = false);
 
   RCLCPP_PUBLIC
   void
