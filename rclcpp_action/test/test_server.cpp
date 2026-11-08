@@ -521,6 +521,51 @@ TEST_F(TestServer, handle_accepted_called)
   EXPECT_EQ(request->goal, *(received_handle->get_goal()));
 }
 
+TEST_F(TestServer, duplicate_goal_id_rejected)
+{
+  auto node = std::make_shared<rclcpp::Node>("dup_goal_node", "/rclcpp_action/dup_goal");
+  const GoalUUID uuid{{3, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}};
+
+  int goal_calls = 0;
+  auto handle_goal = [&goal_calls](
+    const GoalUUID &, std::shared_ptr<const Fibonacci::Goal>)
+    {
+      ++goal_calls;
+      return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    };
+
+  using GoalHandle = rclcpp_action::ServerGoalHandle<Fibonacci>;
+  auto as = rclcpp_action::create_server<Fibonacci>(
+    node, "fibonacci",
+    handle_goal,
+    [](std::shared_ptr<GoalHandle>) {
+      return rclcpp_action::CancelResponse::REJECT;
+    },
+    [](std::shared_ptr<GoalHandle> handle) {
+      handle->succeed(std::make_shared<Fibonacci::Result>());
+    });
+  (void)as;
+
+  auto client = node->create_client<Fibonacci::Impl::SendGoalService>(
+    "fibonacci/_action/send_goal");
+  ASSERT_TRUE(client->wait_for_service(std::chrono::seconds(20)));
+  std::vector<bool> accepted;
+  for (int i = 0; i < 2; ++i) {
+    auto request = std::make_shared<Fibonacci::Impl::SendGoalService::Request>();
+    request->goal_id.uuid = uuid;
+    auto future = client->async_send_request(request);
+    ASSERT_EQ(
+      rclcpp::FutureReturnCode::SUCCESS,
+      rclcpp::spin_until_future_complete(node, future, std::chrono::seconds(10)));
+    accepted.push_back(future.get()->accepted);
+  }
+
+  // The finished goal is kept until its result expires, so its id cannot be used again.
+  EXPECT_TRUE(accepted[0]);
+  EXPECT_FALSE(accepted[1]);
+  EXPECT_EQ(1, goal_calls);
+}
+
 TEST_F(TestServer, handle_cancel_called)
 {
   auto node = std::make_shared<rclcpp::Node>("handle_cancel_node", "/rclcpp_action/handle_cancel");

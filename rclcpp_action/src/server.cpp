@@ -810,6 +810,15 @@ ServerBase::execute_check_expired_goals()
   }
 }
 
+bool
+ServerBase::goal_exists(const GoalUUID & uuid)
+{
+  rcl_action_goal_info_t goal_info = rcl_action_get_zero_initialized_goal_info();
+  convert(uuid, &goal_info);
+  std::lock_guard<std::recursive_mutex> lock(pimpl_->action_server_reentrant_mutex_);
+  return rcl_action_server_goal_exists(pimpl_->action_server_.get(), &goal_info);
+}
+
 void
 ServerBase::publish_status()
 {

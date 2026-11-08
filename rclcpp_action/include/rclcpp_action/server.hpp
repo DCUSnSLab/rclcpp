@@ -27,6 +27,7 @@
 #include "rcl_action/action_server.h"
 #include "rosidl_runtime_c/action_type_support_struct.h"
 #include "rosidl_typesupport_cpp/action_type_support.hpp"
+#include "rclcpp/logging.hpp"
 #include "rclcpp/node_interfaces/node_base_interface.hpp"
 #include "rclcpp/node_interfaces/node_clock_interface.hpp"
 #include "rclcpp/node_interfaces/node_logging_interface.hpp"
@@ -263,6 +264,12 @@ protected:
   void
   notify_goal_terminal_state();
 
+  /// Return whether the action server still tracks a goal with this id.
+  /// \internal
+  RCLCPP_ACTION_PUBLIC
+  bool
+  goal_exists(const GoalUUID & uuid);
+
   /// \internal
   RCLCPP_ACTION_PUBLIC
   void
@@ -426,7 +433,16 @@ protected:
     auto request = std::static_pointer_cast<
       typename ActionT::Impl::SendGoalService::Request>(message);
     auto goal = std::shared_ptr<typename ActionT::Goal>(request, &request->goal);
-    GoalResponse user_response = handle_goal_(uuid, goal);
+    // A goal id that the server still tracks cannot be accepted again, so the request is
+    // rejected without calling the user's callback, as rclpy does.
+    GoalResponse user_response = GoalResponse::REJECT;
+    if (goal_exists(uuid)) {
+      RCLCPP_WARN(
+        rclcpp::get_logger("rclcpp_action"),
+        "Rejected goal %s: the server already has a goal with this id", to_string(uuid).c_str());
+    } else {
+      user_response = handle_goal_(uuid, goal);
+    }
 
     auto ros_response = std::make_shared<typename ActionT::Impl::SendGoalService::Response>();
     ros_response->accepted = GoalResponse::ACCEPT_AND_EXECUTE == user_response ||
